@@ -17,6 +17,7 @@ def _default_context():
         "label": "Neutral",
         "summary": "BTC context is unavailable, so the bot is using its standard confirmation rules.",
         "snapshot": "BTC context unavailable.",
+        "reasons": [],
         "alert_threshold_delta": 0,
         "min_volume_relative": 0.9,
         "min_medium_trend": 5,
@@ -45,22 +46,57 @@ async def get_market_context():
         "btc_rsi": rsi,
         "btc_change_1d": change_1d,
         "btc_change_1w": change_1w,
+        "reasons": [],
     }
+
+    bearish_reasons = []
+    if medium_score <= 4:
+        bearish_reasons.append(f"medium trend {medium_score}/10")
+    if long_score <= 4:
+        bearish_reasons.append(f"long trend {long_score}/10")
+    if change_1d <= -3:
+        bearish_reasons.append(f"1D {change_1d:+.1f}%")
+    if change_1w <= -8:
+        bearish_reasons.append(f"1W {change_1w:+.1f}%")
+
+    bullish_reasons = []
+    if medium_score >= 7:
+        bullish_reasons.append(f"medium trend {medium_score}/10")
+    if long_score >= 7:
+        bullish_reasons.append(f"long trend {long_score}/10")
+    if change_1w > 0:
+        bullish_reasons.append(f"1W {change_1w:+.1f}%")
+
+    severe_risk_off = (
+        change_1d <= -5
+        or change_1w <= -10
+        or (medium_score <= 3 and long_score <= 4)
+    )
 
     if medium_score >= 7 and long_score >= 7 and rsi >= 45 and change_1w > -3:
         context.update({
             "regime": "risk_on",
             "label": "Risk-on",
-            "summary": "BTC trend is supportive, so clean breakout setups can alert with standard conviction.",
+            "summary": (
+                "BTC trend is supportive"
+                + (f" ({', '.join(bullish_reasons[:2])})" if bullish_reasons else "")
+                + ", so clean breakout setups can alert with standard conviction."
+            ),
+            "reasons": bullish_reasons,
             "alert_threshold_delta": 0,
             "min_volume_relative": 0.8,
             "min_medium_trend": 5,
         })
-    elif medium_score <= 4 or long_score <= 4 or change_1d <= -3 or change_1w <= -8:
+    elif severe_risk_off or len(bearish_reasons) >= 2:
         context.update({
             "regime": "risk_off",
-            "label": "Risk-off",
-            "summary": "BTC is defensive, so the bot requires stronger trend and volume confirmation before alerting.",
+            "label": "Cautious",
+            "summary": (
+                "BTC is guarded right now"
+                + (f" because of {', '.join(bearish_reasons[:2])}" if bearish_reasons else "")
+                + ", so the bot requires stronger trend and volume confirmation before alerting."
+            ),
+            "reasons": bearish_reasons,
             "alert_threshold_delta": 1,
             "min_volume_relative": 1.1,
             "min_medium_trend": 6,
@@ -76,7 +112,7 @@ async def get_market_context():
         })
 
     context["snapshot"] = (
-        f"BTC {medium_trend or 'Neutral'}, RSI {rsi:.1f}, "
+        f"BTC Medium {medium_trend or 'Neutral'} | Long {long_trend or 'Neutral'}, RSI {rsi:.1f}, "
         f"1D {change_1d:+.1f}%, 1W {change_1w:+.1f}%"
     )
     return context

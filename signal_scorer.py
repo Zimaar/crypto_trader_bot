@@ -1,6 +1,7 @@
 """Signal scoring engine — multi-layer confirmation + confluence detection."""
 
 import logging
+import re
 from config import SIGNAL_WEIGHTS, MIN_MARKET_CAP
 from database import get_recent_signals
 
@@ -27,6 +28,12 @@ def parse_trend_score(trend_str):
     if not trend_str:
         return 5
     trend_str = str(trend_str)
+    numeric_match = re.search(r"(\d+(?:\.\d+)?)\s*/\s*10", trend_str)
+    if numeric_match:
+        try:
+            return max(0, min(10, int(round(float(numeric_match.group(1))))))
+        except ValueError:
+            pass
     if "Strong Up" in trend_str or "Strong_Up" in trend_str:
         return 9
     if "Up" in trend_str:
