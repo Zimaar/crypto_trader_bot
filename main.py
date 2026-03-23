@@ -1,7 +1,7 @@
 """
 CryptoEdge Signal Bot — Main Entry Point
 =========================================
-ALTfins signals + market context + historical edge tracking → Telegram/WhatsApp alerts
+Premium watchlist alerts + market digest + lifecycle follow-ups → Telegram/WhatsApp
 
 Run: python main.py
 Deploy: Railway / VPS / Docker
@@ -12,20 +12,29 @@ import logging
 import sys
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
-from config import POLL_INTERVAL_SIGNALS, TIMEZONE, TELEGRAM_BOT_TOKEN, ALTFINS_API_KEY
+from config import (
+    ALTFINS_API_KEY,
+    TELEGRAM_BOT_TOKEN,
+    POLL_INTERVAL_SIGNALS,
+    TIMEZONE,
+    MARKET_DIGEST_INTERVAL_HOURS,
+    LIFECYCLE_POLL_INTERVAL_SECONDS,
+)
 from database import init_db
-from telegram_bot import init_telegram, send_telegram
 from engine import (
+    cleanup_dedup_cache,
+    generate_daily_brief,
+    generate_market_digest,
+    monitor_managed_setups,
     scan_breakouts,
     scan_momentum,
     scan_pullbacks,
     update_accuracy,
-    generate_daily_brief,
-    cleanup_dedup_cache,
 )
+from telegram_bot import init_telegram, send_telegram
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +45,6 @@ logger = logging.getLogger("main")
 
 
 def validate_config():
-    """Check that required env vars are set."""
     errors = []
     if not TELEGRAM_BOT_TOKEN:
         errors.append("TELEGRAM_BOT_TOKEN is not set")
@@ -83,6 +91,18 @@ async def main():
         max_instances=1,
         misfire_grace_time=60,
     )
+    scheduler.add_job(
+        generate_market_digest,
+        IntervalTrigger(hours=MARKET_DIGEST_INTERVAL_HOURS),
+        id="market_digest",
+        max_instances=1,
+    )
+    scheduler.add_job(
+        monitor_managed_setups,
+        IntervalTrigger(seconds=LIFECYCLE_POLL_INTERVAL_SECONDS),
+        id="managed_setups",
+        max_instances=1,
+    )
     scheduler.add_job(update_accuracy, IntervalTrigger(hours=6), id="accuracy", max_instances=1)
     scheduler.add_job(generate_daily_brief, CronTrigger(hour=7, minute=0), id="daily_brief")
     scheduler.add_job(cleanup_dedup_cache, CronTrigger(hour=0, minute=0), id="cleanup")
@@ -92,14 +112,16 @@ async def main():
 
     await send_telegram(
         "🤖 CryptoEdge Signal Bot — ONLINE\n\n"
-        "Scanning: Breakouts (3m), Momentum (5m), Pullbacks (10m)\n"
-        "Context: BTC market regime + historical edge filters\n"
+        "Premium lane: Breakouts (3m), Momentum (5m)\n"
+        "Market digest: Every 4h\n"
+        "Lifecycle tracking: Every 15m\n"
         "Daily brief: 7:00 AM GST\n\n"
         "Use /help for commands."
     )
 
     logger.info("Running initial scans...")
     await scan_breakouts()
+    await generate_market_digest()
     logger.info("Initial scans complete.")
 
     try:

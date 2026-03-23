@@ -1,6 +1,7 @@
-"""Telegram/WhatsApp message formatting for all alert types."""
+"""Telegram/WhatsApp message formatting for alerts, digests, and lifecycle updates."""
 
 from datetime import datetime, timezone
+
 from trade_levels import build_trade_plan, format_percent, format_price
 
 
@@ -53,9 +54,9 @@ def _append_indicator_lines(lines, screener_data):
         lines.pop()
 
 
-def _append_trade_plan(lines, signal, screener_data):
+def _append_trade_plan(lines, signal, screener_data, trade_plan=None):
     """Append mandatory trade-plan fields."""
-    trade_plan = build_trade_plan(signal, screener_data)
+    trade_plan = trade_plan or build_trade_plan(signal, screener_data)
     profit = format_percent(trade_plan["profit_pct"])
     loss = format_percent(-trade_plan["loss_pct"]) if trade_plan["loss_pct"] is not None else "N/A"
 
@@ -111,52 +112,82 @@ def _append_market_context(lines, market_context):
     if snapshot:
         lines.append(f"├ {snapshot}")
     if summary:
-        prefix = "└" if snapshot else "└"
-        lines.append(f"{prefix} {summary}")
+        lines.append(f"└ {summary}")
 
 
-def format_signal_alert(signal, score_details, screener_data=None, ai_analysis=None, market_context=None):
+def _append_why_this_passed(lines, score_details, alert_lane, lane_reason, rank):
+    if alert_lane != "premium":
+        return
+
+    setup_type = str(score_details.get("setup_type", "signal")).replace("_", " ").title()
+    ta_score = score_details.get("ta_score", 0)
+    final_score = score_details.get("adjusted_score", ta_score)
+    history_adj = score_details.get("history_adjustment", 0)
+    market_snapshot = score_details.get("market_context_snapshot")
+    gate_reasons = score_details.get("gate_reasons") or []
+
+    block = []
+    if rank is not None:
+        block.append(f"Rank in scan: #{rank}")
+    block.append(f"Setup: {setup_type}")
+    block.append(f"Score: {final_score}/10 (TA {ta_score} + Hist {history_adj:+d})")
+    block.append(f"Lane: {lane_reason or 'premium'}")
+    if market_snapshot:
+        block.append(f"BTC Context: {market_snapshot}")
+    if gate_reasons:
+        block.append(f"Gate Notes: {', '.join(gate_reasons)}")
+    else:
+        block.append("Gate Notes: Passed market-context checks")
+
+    lines.append("✅ Why This Passed:")
+    for index, entry in enumerate(block):
+        connector = "└" if index == len(block) - 1 else "├"
+        lines.append(f"{connector} {entry}")
+
+
+def format_signal_alert(
+    signal,
+    score_details,
+    screener_data=None,
+    ai_analysis=None,
+    market_context=None,
+    alert_lane="standard",
+    lane_reason=None,
+    rank=None,
+):
     """Format a scored signal into a Telegram alert message."""
     symbol = signal.get("symbol", "?")
     name = signal.get("name") or signal.get("symbolName", symbol)
     price = signal.get("lastPrice", "?")
     signal_name = signal.get("signalName", signal.get("signalKey", "?"))
-    direction = signal.get("direction", "?")
     mcap = score_details.get("market_cap", 0)
     ta_score = score_details.get("ta_score", 0)
     adj_score = score_details.get("adjusted_score", 0)
     history_adj = score_details.get("history_adjustment", 0)
 
-    # Determine alert emoji based on signal type
     signal_key = score_details.get("signal_type", "")
-    if "BREAKOUT" in signal_key or "PATTERN" in signal_key:
+    setup_type = score_details.get("setup_type", "")
+    if "BREAKOUT" in signal_key or setup_type == "breakout":
         emoji = "🔺"
         label = "BREAKOUT"
-    elif "PULLBACK" in signal_key:
+    elif "PULLBACK" in signal_key or setup_type == "pullback":
         emoji = "📉➡📈"
-        label = "PULLBACK BUY"
-    elif "MOMENTUM" in signal_key or "MACD" in signal_key:
+        label = "PULLBACK"
+    elif "MOMENTUM" in signal_key or "MACD" in signal_key or setup_type == "momentum":
         emoji = "⚡"
         label = "MOMENTUM"
     else:
         emoji = "📊"
         label = "SIGNAL"
 
-    # Urgency indicator
-    if adj_score >= 9:
-        urgency = "🔥🔥 MAX CONVICTION"
-    elif adj_score >= 8:
-        urgency = "🔥 HIGH CONVICTION"
+    if alert_lane == "premium":
+        heading = f"{emoji} PREMIUM {label} — {symbol} ({name}) — ${price}"
     else:
-        urgency = ""
+        heading = f"{emoji} {label} — {symbol} ({name}) — ${price}"
 
-    lines = [f"{emoji} {label} — {symbol} ({name}) — ${price}"]
-    if urgency:
-        lines.append(f"{urgency}")
-    lines.append("")
-    lines.append(f"📊 Signal: {signal_name}")
+    lines = [heading, "", f"📊 Signal: {signal_name}"]
+    _append_why_this_passed(lines, score_details, alert_lane, lane_reason, rank)
 
-    # TA Details
     ta_lines = []
     rsi = score_details.get("rsi")
     if rsi is not None:
@@ -189,11 +220,12 @@ def format_signal_alert(signal, score_details, screener_data=None, ai_analysis=N
 
     confluence = score_details.get("confluence_count", 0)
     if confluence >= 2:
-        ta_lines.append(f"└ ⚡ Confluence: {confluence} signals in 24h")
+        ta_lines.append(f"└ ⚡ Confluence: {confluence} recent signal events")
     elif ta_lines:
         ta_lines[-1] = ta_lines[-1].replace("├", "└", 1)
 
     if ta_lines:
+        lines.append("")
         lines.extend(ta_lines)
 
     _append_history_edge(lines, score_details)
@@ -202,19 +234,15 @@ def format_signal_alert(signal, score_details, screener_data=None, ai_analysis=N
     _append_trade_plan(lines, signal, screener_data)
     _append_market_context(lines, market_context)
 
-    # Score
-    lines.append("")
-    lines.append(f"📈 Score: {adj_score}/10 (TA: {ta_score}, History: {history_adj:+d})")
-
     if ai_analysis:
         lines.append("")
         lines.append("🤖 AI View:")
         lines.append(ai_analysis)
 
-    # Timestamp
     now = datetime.now(timezone.utc).strftime("%b %d, %Y %I:%M %p UTC")
+    lines.append("")
+    lines.append(f"📈 Score: {adj_score}/10 (TA: {ta_score}, History: {history_adj:+d})")
     lines.append(f"⏰ {now}")
-
     return "\n".join(lines)
 
 
@@ -243,13 +271,11 @@ def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysi
         pattern = ta.get("patternType", "?")
         stage = ta.get("patternStage", "?")
 
-        # Parse the HTML description to extract key info
-        desc_raw = ta.get("description", "")
-        # Strip HTML tags simply
         import re
+
+        desc_raw = ta.get("description", "")
         desc_clean = re.sub(r"<[^>]+>", " ", desc_raw)
         desc_clean = re.sub(r"\s+", " ", desc_clean).strip()
-        # Truncate
         if len(desc_clean) > 600:
             desc_clean = desc_clean[:600] + "..."
 
@@ -297,6 +323,56 @@ def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysi
     return "\n".join(lines)
 
 
+def format_market_digest(watchlist_candidates, market_candidates, market_context=None):
+    """Format the scheduled or manual market digest."""
+    if not watchlist_candidates and not market_candidates:
+        return "📬 MARKET DIGEST\n\nNo high-conviction watchlist or market opportunities right now."
+
+    lines = ["📬 MARKET DIGEST"]
+    _append_market_context(lines, market_context)
+
+    def add_section(title, candidates):
+        if not candidates:
+            return
+        lines.append("")
+        lines.append(title)
+        for candidate in candidates:
+            trade_plan = candidate.get("trade_plan") or build_trade_plan(
+                candidate.get("signal"),
+                candidate.get("screener_data"),
+            )
+            setup_label = str(candidate.get("setup_type", "signal")).replace("_", " ").title()
+            lines.append(
+                f"• {candidate['symbol']} — {setup_label} — Score {candidate['final_score']} "
+                f"| Breakout {format_price(trade_plan.get('breakout_price'))}"
+            )
+
+    add_section("🎯 Watchlist Opportunities", watchlist_candidates)
+    add_section("🌐 Market Opportunities", market_candidates)
+    return "\n".join(lines)
+
+
+def format_setup_lifecycle_update(setup, status, latest_price):
+    """Format a premium setup lifecycle update."""
+    labels = {
+        "entered": "✅ SETUP ENTERED",
+        "tp_hit": "🎯 TP HIT",
+        "stopped": "🛑 STOP HIT",
+        "invalidated": "⚠️ INVALIDATED BEFORE TRIGGER",
+        "expired": "⌛ SETUP EXPIRED",
+    }
+    lines = [
+        f"{labels.get(status, '📍 SETUP UPDATE')} — {setup['symbol']}",
+        "",
+        f"📌 Setup: {str(setup.get('setup_type', 'signal')).replace('_', ' ').title()}",
+        f"💵 Latest Price: {format_price(latest_price)}",
+        f"├ Breakout Price: {format_price(setup.get('breakout_price'))}",
+        f"├ TP: {format_price(setup.get('tp_price'))}",
+        f"└ Stop: {format_price(setup.get('stop_price'))}",
+    ]
+    return "\n".join(lines)
+
+
 def format_daily_brief(signals_today, market_context, headlines=None):
     """Format the morning daily brief."""
     now = datetime.now(timezone.utc).strftime("%b %d, %Y")
@@ -310,24 +386,23 @@ def format_daily_brief(signals_today, market_context, headlines=None):
     if snapshot:
         lines.append(f"├ {snapshot}")
     if summary:
-        prefix = "└" if snapshot else "└"
-        lines.append(f"{prefix} {summary}")
+        lines.append(f"└ {summary}")
     lines.append("")
 
     if headlines:
         lines.append("📰 Market Headlines:")
-        for h in headlines[:3]:
-            lines.append(f"├ {h[:80]}")
+        for headline in headlines[:3]:
+            lines.append(f"├ {headline[:80]}")
         lines[-1] = lines[-1].replace("├", "└", 1)
         lines.append("")
 
     if signals_today:
         lines.append(f"🔥 Top Signals (last 24h): {len(signals_today)}")
-        for i, s in enumerate(signals_today[:5]):
-            sym = s.get("symbol", "?")
-            sname = s.get("signalName", s.get("signal_name", "?"))
-            score = s.get("adjusted_score", s.get("score", "?"))
-            lines.append(f"{i+1}. {sym} — {sname} | Score: {score}")
+        for index, signal in enumerate(signals_today[:5], start=1):
+            symbol = signal.get("symbol", "?")
+            signal_name = signal.get("signalName", signal.get("signal_name", "?"))
+            score = signal.get("adjusted_score", signal.get("score", "?"))
+            lines.append(f"{index}. {symbol} — {signal_name} | Score: {score}")
     else:
         lines.append("📭 No high-quality signals in the last 24h.")
 
@@ -345,17 +420,17 @@ def format_accuracy_report(stats):
     total_wins = 0
     total_losses = 0
 
-    for s in stats:
-        key = s["signal_key"].replace(".TXT", "")
-        total = s["total"]
-        resolved = s.get("resolved", 0) or 0
-        wins = s["wins"]
-        losses = s["losses"]
+    for row in stats:
+        key = row["signal_key"].replace(".TXT", "")
+        total = row["total"]
+        resolved = row.get("resolved", 0) or 0
+        wins = row["wins"]
+        losses = row["losses"]
         total_signals += total
         total_resolved += resolved
         total_wins += wins
         total_losses += losses
-        pct = f"{wins/resolved*100:.0f}%" if resolved > 0 else "N/A"
+        pct = f"{wins / resolved * 100:.0f}%" if resolved > 0 else "N/A"
         lines.append(f"├ {key}: {pct} hit TP ({wins}/{resolved} resolved, {total} total)")
 
     if total_resolved > 0:

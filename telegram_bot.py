@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from telegram import Update, BotCommand
+from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config import (
@@ -15,16 +15,19 @@ from config import (
     ALLOWED_TELEGRAM_USER_IDS,
 )
 from database import (
-    get_config,
-    set_config,
+    add_focus_symbols,
+    clear_focus_symbols,
     get_accuracy_stats,
-    get_signal_count_today,
+    get_config,
     get_focus_symbols,
+    get_signal_count_today,
+    remove_focus_symbols,
+    set_config,
     set_focus_symbols,
 )
-from altfins_client import screener_symbol, get_signal_feed
+from altfins_client import get_signal_feed, screener_symbol
 from ai_module import ai_enabled, analyze_symbol_setup
-from formatters import format_ta_report, format_accuracy_report
+from formatters import format_accuracy_report, format_ta_report
 from market_context import get_market_context
 from news_client import get_market_news
 from whatsapp_client import send_whatsapp
@@ -37,7 +40,6 @@ allowed_user_ids = {str(user_id) for user_id in ALLOWED_TELEGRAM_USER_IDS}
 
 
 async def _get_target_chat_id():
-    """Resolve the best chat id for outbound notifications."""
     global active_chat_id
     if active_chat_id:
         return str(active_chat_id)
@@ -49,7 +51,6 @@ async def _get_target_chat_id():
 
 
 async def _remember_chat_from_update(update: Update):
-    """Persist the latest private chat id after the user messages the bot."""
     global active_chat_id
     if not update or not update.effective_chat:
         return
@@ -64,7 +65,6 @@ async def _remember_chat_from_update(update: Update):
 
 
 async def _prepare_private_chat(update: Update):
-    """Authorize the caller and remember the active private chat."""
     user_id = str(getattr(update.effective_user, "id", ""))
     if allowed_user_ids and user_id not in allowed_user_ids:
         logger.warning("Rejected Telegram access from unauthorized user %s.", user_id)
@@ -76,7 +76,6 @@ async def _prepare_private_chat(update: Update):
 
 
 async def init_telegram():
-    """Initialize the Telegram bot application."""
     global app, active_chat_id
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     stored_chat_id = await get_config("telegram_chat_id")
@@ -84,14 +83,15 @@ async def init_telegram():
         active_chat_id = str(stored_chat_id)
 
     commands = [
-        ("scan", "Force a full signal scan NOW"),
+        ("scan", "Run a full premium scan now"),
+        ("digest", "Force the market digest now"),
         ("ta", "Market snapshot for a coin: /ta BTC"),
         ("ai", "AI analysis for a coin: /ai BTC"),
-        ("accuracy", "Signal accuracy stats (30d)"),
-        ("signals", "Signal count today"),
+        ("accuracy", "Premium alert accuracy stats (30d)"),
+        ("signals", "Premium alerts sent today"),
         ("news", "Latest crypto news: /news or /news BTC"),
-        ("focus", "View/set focus list: /focus BTC ETH"),
-        ("brief", "Force daily brief NOW"),
+        ("focus", "Manage premium watchlist: /focus show"),
+        ("brief", "Force daily brief now"),
         ("pause", "Pause all alerts"),
         ("resume", "Resume alerts"),
         ("help", "Show all commands"),
@@ -101,6 +101,7 @@ async def init_telegram():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("ta", cmd_ta))
     app.add_handler(CommandHandler("accuracy", cmd_accuracy))
     app.add_handler(CommandHandler("signals", cmd_signals))
@@ -119,13 +120,14 @@ async def init_telegram():
 
 
 async def send_telegram(message: str, urgent: bool = False):
-    """Send a message to your Telegram chat."""
+    """Send a message to the active Telegram chat."""
     if not app:
         return
     chat_id = await _get_target_chat_id()
     if not chat_id:
         logger.warning("Telegram chat id is not known yet. Send /start to the bot once to enable alerts.")
         return
+
     try:
         if len(message) > 4000:
             message = message[:3997] + "..."
@@ -157,9 +159,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "🤖 CryptoEdge Signal Bot — Active\n\n"
-        "I scan ALTfins for high-probability setups, score them with trend, volume, "
-        "and tracked hit-rate data, then alert you when the market context supports the trade.\n\n"
-        "Use /help to see all commands."
+        "I now run two lanes: premium instant alerts for your best setups and a market digest for "
+        "secondary opportunities. Use /focus to manage your premium watchlist and /help for commands."
     )
 
 
@@ -168,15 +169,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📋 COMMANDS\n\n"
-        "/scan — Force full signal scan NOW\n"
+        "/scan — Force a full premium scan now\n"
+        "/digest — Force the market digest now\n"
         "/ta BTC — Market snapshot for any coin\n"
         "/ai BTC — AI analysis for any coin\n"
-        "/focus BTC ETH — Alert only on selected symbols\n"
-        "/focus all — Clear focus list and scan whole market\n"
-        "/accuracy — Signal accuracy stats (30 days)\n"
-        "/signals — How many signals sent today\n"
+        "/focus — Show premium watchlist\n"
+        "/focus add BTC ETH — Add symbols to premium watchlist\n"
+        "/focus remove BTC ETH — Remove symbols from premium watchlist\n"
+        "/focus set BTC ETH — Replace premium watchlist\n"
+        "/focus clear — Clear premium watchlist and use market-wide sniper mode\n"
+        "/accuracy — Premium alert accuracy stats (30 days)\n"
+        "/signals — Premium alerts sent today\n"
         "/news — Latest crypto headlines (or /news BTC)\n"
-        "/brief — Force daily brief NOW\n"
+        "/brief — Force daily brief now\n"
         "/pause — Pause all alerts\n"
         "/resume — Resume alerts\n"
     )
@@ -185,10 +190,23 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _prepare_private_chat(update):
         return
-    await update.message.reply_text("🔍 Scanning all signal sources NOW...")
+    await update.message.reply_text("🔍 Running a full premium scan...")
     from engine import run_full_scan
-    count = await run_full_scan()
-    await update.message.reply_text(f"✅ Scan complete. {count} alerts generated.")
+
+    results = await run_full_scan()
+    await update.message.reply_text(
+        f"✅ Scan complete.\nPremium alerts sent: {results['premium_sent']}\nDigest candidates found: {results['digest_candidates']}"
+    )
+
+
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _prepare_private_chat(update):
+        return
+    await update.message.reply_text("📬 Building market digest...")
+    from engine import generate_market_digest
+
+    msg = await generate_market_digest(send=False)
+    await update.message.reply_text(msg)
 
 
 async def _load_symbol_snapshot(symbol):
@@ -267,15 +285,14 @@ async def cmd_accuracy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _prepare_private_chat(update):
         return
     stats = await get_accuracy_stats(days=30)
-    msg = format_accuracy_report(stats)
-    await update.message.reply_text(msg)
+    await update.message.reply_text(format_accuracy_report(stats))
 
 
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _prepare_private_chat(update):
         return
     count = await get_signal_count_today()
-    await update.message.reply_text(f"📊 Signals alerted today: {count}")
+    await update.message.reply_text(f"📊 Premium alerts sent today: {count}")
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,30 +317,65 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _prepare_private_chat(update):
         return
-    if not context.args:
+
+    args = [arg.upper() for arg in context.args]
+    if not args or args[0] == "SHOW":
         focus = await get_focus_symbols()
         if focus:
-            await update.message.reply_text("🎯 Current focus list:\n" + ", ".join(focus))
+            await update.message.reply_text("🎯 Premium watchlist:\n" + ", ".join(focus))
         else:
             await update.message.reply_text(
-                "🎯 Focus list is empty. The bot is scanning the whole market."
+                "🎯 Premium watchlist is empty. The bot is using market-wide sniper mode."
             )
         return
 
-    raw = " ".join(context.args).strip()
-    if raw.lower() in {"all", "clear", "off"}:
-        await set_focus_symbols([])
+    raw_first = context.args[0].strip().lower()
+    if raw_first in {"all", "clear", "off"}:
+        focus = await clear_focus_symbols()
         await update.message.reply_text(
-            "🎯 Focus list cleared. The bot will scan the whole market again."
+            "🎯 Premium watchlist cleared. The bot is back in market-wide sniper mode."
         )
         return
 
-    tokens = raw.replace(",", " ").split()
-    focus = await set_focus_symbols(tokens)
-    if not focus:
-        await update.message.reply_text("Usage: /focus BTC ETH SOL")
+    action = raw_first
+    symbols = [token for token in args[1:] if token not in {"SHOW", "ADD", "REMOVE", "SET", "CLEAR"}]
+
+    if action == "add":
+        if not symbols:
+            await update.message.reply_text("Usage: /focus add BTC ETH")
+            return
+        focus = await add_focus_symbols(symbols)
+        await update.message.reply_text("🎯 Premium watchlist updated:\n" + ", ".join(focus))
         return
-    await update.message.reply_text("🎯 Focus list updated:\n" + ", ".join(focus))
+
+    if action == "remove":
+        if not symbols:
+            await update.message.reply_text("Usage: /focus remove BTC ETH")
+            return
+        focus = await remove_focus_symbols(symbols)
+        if focus:
+            await update.message.reply_text("🎯 Premium watchlist updated:\n" + ", ".join(focus))
+        else:
+            await update.message.reply_text(
+                "🎯 Premium watchlist is now empty. The bot is using market-wide sniper mode."
+            )
+        return
+
+    if action == "set":
+        if not symbols:
+            await update.message.reply_text("Usage: /focus set BTC ETH")
+            return
+        focus = await set_focus_symbols(symbols)
+        await update.message.reply_text("🎯 Premium watchlist set to:\n" + ", ".join(focus))
+        return
+
+    tokens = [arg for arg in args if arg not in {"SHOW", "ADD", "REMOVE", "SET", "CLEAR"}]
+    if not tokens:
+        await update.message.reply_text("Usage: /focus show | add BTC ETH | remove BTC ETH | set BTC ETH | clear")
+        return
+
+    focus = await set_focus_symbols(tokens)
+    await update.message.reply_text("🎯 Premium watchlist set to:\n" + ", ".join(focus))
 
 
 async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -331,6 +383,7 @@ async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("☀️ Generating daily brief...")
     from engine import generate_daily_brief
+
     msg = await generate_daily_brief()
     await update.message.reply_text(msg)
 
