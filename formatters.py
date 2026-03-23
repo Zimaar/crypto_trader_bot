@@ -1,8 +1,6 @@
 """Telegram/WhatsApp message formatting for all alert types."""
 
 from datetime import datetime, timezone
-from geo_module import geo_label
-from signal_scorer import parse_trend_score
 from trade_levels import build_trade_plan, format_percent, format_price
 
 
@@ -72,7 +70,52 @@ def _append_trade_plan(lines, signal, screener_data):
         lines[-1] = lines[-1].replace("├", "└", 1)
 
 
-def format_signal_alert(signal, score_details, screener_data=None, ai_analysis=None):
+def _append_history_edge(lines, score_details):
+    """Append historical performance context when enough data exists."""
+    history_lines = []
+
+    signal_resolved = score_details.get("signal_history_resolved", 0)
+    signal_win_rate = score_details.get("signal_history_win_rate")
+    if signal_resolved and signal_win_rate is not None:
+        signal_adj = score_details.get("signal_history_adjustment", 0)
+        history_lines.append(
+            f"├ Signal type edge: {signal_win_rate:.0%} ({signal_resolved} resolved, {signal_adj:+d})"
+        )
+
+    symbol_resolved = score_details.get("symbol_history_resolved", 0)
+    symbol_win_rate = score_details.get("symbol_history_win_rate")
+    if symbol_resolved and symbol_win_rate is not None:
+        symbol_adj = score_details.get("symbol_history_adjustment", 0)
+        history_lines.append(
+            f"├ Symbol edge: {symbol_win_rate:.0%} ({symbol_resolved} resolved, {symbol_adj:+d})"
+        )
+
+    if not history_lines:
+        return
+
+    history_lines[-1] = history_lines[-1].replace("├", "└", 1)
+    lines.append("")
+    lines.append("🧠 Historical Edge:")
+    lines.extend(history_lines)
+
+
+def _append_market_context(lines, market_context):
+    """Append BTC market context without turning it into a score."""
+    if not market_context:
+        return
+
+    lines.append("")
+    lines.append(f"🧭 Market Context: {market_context.get('label', 'Neutral')}")
+    snapshot = market_context.get("snapshot")
+    summary = market_context.get("summary")
+    if snapshot:
+        lines.append(f"├ {snapshot}")
+    if summary:
+        prefix = "└" if snapshot else "└"
+        lines.append(f"{prefix} {summary}")
+
+
+def format_signal_alert(signal, score_details, screener_data=None, ai_analysis=None, market_context=None):
     """Format a scored signal into a Telegram alert message."""
     symbol = signal.get("symbol", "?")
     name = signal.get("name") or signal.get("symbolName", symbol)
@@ -82,8 +125,7 @@ def format_signal_alert(signal, score_details, screener_data=None, ai_analysis=N
     mcap = score_details.get("market_cap", 0)
     ta_score = score_details.get("ta_score", 0)
     adj_score = score_details.get("adjusted_score", 0)
-    geo = score_details.get("geo_score", 0)
-    geo_adj = score_details.get("geo_adjustment", 0)
+    history_adj = score_details.get("history_adjustment", 0)
 
     # Determine alert emoji based on signal type
     signal_key = score_details.get("signal_type", "")
@@ -154,20 +196,15 @@ def format_signal_alert(signal, score_details, screener_data=None, ai_analysis=N
     if ta_lines:
         lines.extend(ta_lines)
 
+    _append_history_edge(lines, score_details)
+
     lines.append("")
     _append_trade_plan(lines, signal, screener_data)
-
-    # Geo context
-    lines.append("")
-    geo_lbl, geo_note = geo_label(geo)
-    lines.append(f"🌍 Geo: {geo_lbl}")
-    if geo_adj != 0:
-        lines.append(f"├ Score adjusted: {ta_score} → {adj_score} ({geo_adj:+d})")
-    lines.append(f"└ {geo_note}")
+    _append_market_context(lines, market_context)
 
     # Score
     lines.append("")
-    lines.append(f"📈 Score: {adj_score}/10 (TA: {ta_score}, Geo: {geo_adj:+d})")
+    lines.append(f"📈 Score: {adj_score}/10 (TA: {ta_score}, History: {history_adj:+d})")
 
     if ai_analysis:
         lines.append("")
@@ -181,7 +218,7 @@ def format_signal_alert(signal, score_details, screener_data=None, ai_analysis=N
     return "\n".join(lines)
 
 
-def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysis=None):
+def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysis=None, market_context=None):
     """Format a technical analysis report for /ta command."""
     if not ta_data and not screener_data and not latest_signal:
         return "No current market snapshot found for this symbol."
@@ -239,6 +276,10 @@ def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysi
             lines.append(f"💵 Last Price: ${price}")
             if timestamp:
                 lines.append(f"🕒 Signal Time: {timestamp} UTC")
+        elif screener_data:
+            price = screener_data.get("lastPrice")
+            if price not in (None, ""):
+                lines.append(f"💵 Last Price: ${price}")
 
     if screener_data:
         lines.append("")
@@ -246,6 +287,7 @@ def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysi
 
     lines.append("")
     _append_trade_plan(lines, latest_signal, screener_data)
+    _append_market_context(lines, market_context)
 
     if ai_analysis:
         lines.append("")
@@ -255,21 +297,29 @@ def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysi
     return "\n".join(lines)
 
 
-def format_daily_brief(signals_today, geo_score, geo_headlines, events=None):
+def format_daily_brief(signals_today, market_context, headlines=None):
     """Format the morning daily brief."""
     now = datetime.now(timezone.utc).strftime("%b %d, %Y")
-    geo_lbl, geo_note = geo_label(geo_score)
-
     lines = [
         f"☀️ DAILY BRIEF — {now}",
         "",
-        f"🌍 Geo Score: {geo_score} {geo_lbl}",
+        f"🧭 Market Context: {(market_context or {}).get('label', 'Neutral')}",
     ]
-    if geo_headlines:
-        for h in geo_headlines[:3]:
-            lines.append(f"├ {h[:80]}")
-    lines.append(f"└ {geo_note}")
+    snapshot = (market_context or {}).get("snapshot")
+    summary = (market_context or {}).get("summary")
+    if snapshot:
+        lines.append(f"├ {snapshot}")
+    if summary:
+        prefix = "└" if snapshot else "└"
+        lines.append(f"{prefix} {summary}")
     lines.append("")
+
+    if headlines:
+        lines.append("📰 Market Headlines:")
+        for h in headlines[:3]:
+            lines.append(f"├ {h[:80]}")
+        lines[-1] = lines[-1].replace("├", "└", 1)
+        lines.append("")
 
     if signals_today:
         lines.append(f"🔥 Top Signals (last 24h): {len(signals_today)}")
@@ -281,14 +331,6 @@ def format_daily_brief(signals_today, geo_score, geo_headlines, events=None):
     else:
         lines.append("📭 No high-quality signals in the last 24h.")
 
-    if events:
-        lines.append("")
-        lines.append("📅 Upcoming Events:")
-        for ev in events[:5]:
-            title = ev.get("title", "?")[:60]
-            date = ev.get("dateEvent", "?")[:10]
-            lines.append(f"├ {date}: {title}")
-
     return "\n".join(lines)
 
 
@@ -299,49 +341,28 @@ def format_accuracy_report(stats):
 
     lines = ["📊 SIGNAL ACCURACY — Last 30 Days", ""]
     total_signals = 0
+    total_resolved = 0
     total_wins = 0
     total_losses = 0
 
     for s in stats:
         key = s["signal_key"].replace(".TXT", "")
         total = s["total"]
+        resolved = s.get("resolved", 0) or 0
         wins = s["wins"]
         losses = s["losses"]
         total_signals += total
+        total_resolved += resolved
         total_wins += wins
         total_losses += losses
-        pct = f"{wins/total*100:.0f}%" if total > 0 else "N/A"
-        lines.append(f"├ {key}: {pct} hit TP ({wins}/{total})")
+        pct = f"{wins/resolved*100:.0f}%" if resolved > 0 else "N/A"
+        lines.append(f"├ {key}: {pct} hit TP ({wins}/{resolved} resolved, {total} total)")
 
-    if total_signals > 0:
-        overall = total_wins / total_signals * 100
+    if total_resolved > 0:
+        overall = total_wins / total_resolved * 100
         lines.append("")
-        lines.append(f"📈 Overall: {overall:.0f}% ({total_wins}/{total_signals})")
+        lines.append(f"📈 Overall: {overall:.0f}% ({total_wins}/{total_resolved} resolved)")
+        lines.append(f"📦 Total alerts tracked: {total_signals}")
         lines.append(f"🛑 Stopped out: {total_losses}")
-
-    return "\n".join(lines)
-
-
-def format_geo_alert(old_score, new_score, headlines):
-    """Format a geopolitical shift alert."""
-    direction = "⬆️" if new_score > old_score else "⬇️"
-    old_lbl, _ = geo_label(old_score)
-    new_lbl, new_note = geo_label(new_score)
-
-    lines = [
-        f"🌍 GEO ALERT — Score shifted: {old_score} → {new_score} {direction}",
-        "",
-        f"Was: {old_lbl}",
-        f"Now: {new_lbl}",
-        "",
-    ]
-
-    if headlines:
-        lines.append("Headlines driving the shift:")
-        for h in headlines[:4]:
-            lines.append(f"├ {h[:100]}")
-        lines.append("")
-
-    lines.append(f"📈 Trading implication: {new_note}")
 
     return "\n".join(lines)

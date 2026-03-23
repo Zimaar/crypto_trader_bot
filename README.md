@@ -1,181 +1,104 @@
 # CryptoEdge Signal Bot
 
-**ALTfins signals + geopolitical war awareness → Telegram/WhatsApp alerts**
+**ALTfins signals + BTC market context + historical edge tracking → Telegram alerts**
 
-Personal trading signal bot that scans 2,000+ crypto assets for high-probability breakouts,
-pullbacks, and momentum signals — filtered through TA quality scoring AND real-time
-geopolitical context (US-Iran war, macro headlines, sanctions, BTC fear barometer).
+Personal crypto signal bot that scans ALTfins for breakout, pullback, and momentum setups, scores them with trend and liquidity confirmation, learns from tracked outcomes, and sends focused alerts to Telegram.
 
----
+## What Changed
 
-## What It Does
+The bot now does three things better:
 
-1. **Polls ALTfins** every 3–10 minutes for breakout, momentum, and pullback signals
-2. **Scores each signal 0–10** using multi-layer confirmation (trend, RSI, volume, confluence)
-3. **Adjusts for geopolitics** — suppresses signals during escalation, boosts during de-escalation
-4. **Sends you alerts** via Telegram (and optionally WhatsApp) with full TA breakdown
-5. **Tracks accuracy** — checks if past signals hit targets or stops over 24h/72h/7d
+1. **Learns from outcomes**: signal-type and symbol-level hit rates now feed back into scoring.
+2. **Filters randomness**: alerts are gated by BTC-led market context instead of a geopolitical score.
+3. **Uses stronger data fallbacks**: `/ta` uses screener snapshots and recent signals, while `/news` uses NewsAPI with RSS fallback.
 
----
+## Core Features
 
-## Quick Setup (5 minutes)
-
-### Step 1: Get Your API Keys
-
-| Service | Where | Notes |
-|---------|-------|-------|
-| **ALTfins API** | [altfins.com](https://altfins.com) → Account → API Keys | Free tier = 1,000 credits/mo |
-| **Telegram Bot** | Message [@BotFather](https://t.me/BotFather) → /newbot | Gives you the bot token |
-| **Telegram Chat ID** | Message [@userinfobot](https://t.me/userinfobot) | Your numeric chat ID |
-| **NewsAPI** (optional) | [newsapi.org](https://newsapi.org) | Free = 100 req/day. For geo scoring |
-| **WhatsApp** (optional) | [Meta Business](https://business.facebook.com) → WhatsApp API | Free 1,000 convos/mo |
-
-### Step 2: Configure
-
-```bash
-cp .env.example .env
-# Edit .env with your API keys
-```
-
-### Step 3: Run Locally
-
-```bash
-pip install -r requirements.txt
-python main.py
-```
-
-### Step 4: Deploy (Always-On)
-
-**Option A: Railway (Recommended — $5/mo)**
-```bash
-# Install Railway CLI: https://docs.railway.app/guides/cli
-railway login
-railway init
-railway up
-# Set env vars in Railway dashboard
-```
-
-**Option B: Docker (Any VPS)**
-```bash
-docker build -t crypto-bot .
-docker run -d --env-file .env --name crypto-bot crypto-bot
-```
-
-**Option C: DigitalOcean / AWS / Any VPS**
-```bash
-# SSH into your server
-git clone <your-repo>
-cd crypto_signal_bot
-pip install -r requirements.txt
-# Use screen/tmux/systemd to keep it running
-screen -S bot
-python main.py
-# Ctrl+A, D to detach
-```
-
----
+- Polls ALTfins every few minutes for breakout, momentum, and pullback signals
+- Scores each setup with signal type, trend, RSI, volume, confluence, and historical win-rate feedback
+- Uses BTC market regime to tighten or relax alert conditions
+- Sends Telegram alerts with mandatory `Breakout Price`, `TP`, `Profit`, and `Loss`
+- Supports AI analysis with OpenAI via `/ai BTC`
+- Tracks outcomes over 24h, 72h, and 7d for feedback and accuracy reporting
+- Supports a personal focus list with `/focus BTC ETH SOL`
 
 ## Telegram Commands
 
 | Command | What It Does |
 |---------|-------------|
-| `/scan` | Force a full signal scan NOW |
-| `/ta BTC` | Full TA report for any coin |
-| `/ai BTC` | AI read on the latest setup for any coin |
+| `/scan` | Force a full signal scan now |
+| `/ta BTC` | Live market snapshot for a symbol |
+| `/ai BTC` | AI analysis using the latest setup |
 | `/focus BTC ETH SOL` | Alert only on selected symbols |
-| `/focus all` | Clear the focus list and scan the whole market |
-| `/geo` | Current geopolitical sentiment score (-3 to +3) |
-| `/accuracy` | Signal hit rate over last 30 days |
+| `/focus all` | Clear the focus list |
+| `/accuracy` | Signal hit-rate report over the last 30 days |
 | `/signals` | Count of alerts sent today |
-| `/news` | Latest crypto headlines (or `/news BTC`) |
-| `/events` | Upcoming catalyst events |
-| `/brief` | Force daily morning brief |
-| `/pause` | Pause all alerts |
+| `/news` | Latest market headlines |
+| `/news BTC` | Headlines filtered for one symbol |
+| `/brief` | Force the daily brief now |
+| `/pause` | Pause alerts |
 | `/resume` | Resume alerts |
-
----
 
 ## How Scoring Works
 
-Every signal passes through 6 layers:
+Every signal now goes through these layers:
 
+1. Base weight by ALTfins signal type
+2. Trend alignment from screener data
+3. RSI quality check
+4. Relative-volume confirmation
+5. Confluence bonus for multiple recent signals
+6. Historical edge bonus or penalty from tracked outcomes
+7. BTC market-context gating before alert delivery
+
+Signals still need to clear the alert threshold, but the threshold becomes stricter when BTC is in a risk-off regime.
+
+## Quick Setup
+
+```bash
+cp .env.example .env
+pip install -r requirements.txt
+python main.py
 ```
-Layer 1: ALTfins signal fires (base weight by type)
-Layer 2: Screener cross-check (trend + MACD alignment)
-Layer 3: RSI sweet spot (40–65 = bonus, >75 = penalty)
-Layer 4: Volume confirmation (>1.3x = bonus, >2.5x = double bonus)
-Layer 5: Confluence detection (2+ signals on same coin = bonus)
-Layer 6: Geopolitical adjustment (-3 to +1 modifier)
-```
 
-Only signals scoring **7+** (after geo adjustment) reach your phone.
-Signals scoring **9+** hit both Telegram AND WhatsApp.
+Required environment variables:
 
----
+- `ALTFINS_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
 
-## Geopolitical Score (-3 to +3)
+Common optional variables:
 
-| Score | Meaning | Effect |
-|-------|---------|--------|
-| +3 | Confirmed de-escalation | Signals boosted +1 |
-| +2 | De-escalation hints | Signals boosted +1 |
-| +1 | Calm | No change |
-| 0 | Mixed/uncertain | No change |
-| -1 | Escalation rhetoric | Signals reduced -1 |
-| -2 | Active strikes | Only score 9+ passes. Most suppressed. |
-| -3 | Major escalation | Buy signals suppressed entirely. |
+- `TELEGRAM_CHAT_ID`
+- `ALLOWED_TELEGRAM_USER_IDS`
+- `NEWSAPI_KEY`
+- `OPENAI_API_KEY`
+- `AI_ALERT_ANALYSIS_ENABLED=true`
+- `FOCUS_SYMBOLS=BTC,ETH,SOL`
+- `DB_PATH=/data/bot_data.db`
 
----
+## Railway Deployment
+
+This bot is Railway-friendly:
+
+- Deploy from the included `Dockerfile`
+- Set env vars in Railway
+- Mount a persistent volume and point `DB_PATH` to `/data/bot_data.db`
+- Keep `.env` local and do not commit secrets
 
 ## File Structure
 
-```
+```text
 crypto_signal_bot/
-├── main.py              # Entry point — starts scheduler + Telegram bot
-├── config.py            # All settings from .env
-├── engine.py            # Core scan/score/alert loop
-├── altfins_client.py    # ALTfins API async wrapper
-├── signal_scorer.py     # Multi-layer signal scoring
-├── geo_module.py        # Geopolitical sentiment (war/macro)
-├── formatters.py        # Telegram message templates
-├── telegram_bot.py      # Telegram commands + notifications
-├── whatsapp_client.py   # WhatsApp Cloud API (optional)
-├── database.py          # SQLite for logs + accuracy tracking
-├── requirements.txt     # Python dependencies
-├── .env.example         # Environment variable template
-├── Dockerfile           # For Docker/Railway deployment
-└── README.md            # This file
+├── main.py              # Entry point and scheduler
+├── engine.py            # Scan, score, filter, alert loop
+├── signal_scorer.py     # Scoring and historical edge weighting
+├── market_context.py    # BTC-led market regime logic
+├── news_client.py       # NewsAPI + RSS fallback
+├── altfins_client.py    # ALTfins signals, screener, and price snapshots
+├── telegram_bot.py      # Telegram command handlers
+├── formatters.py        # Alert and report formatting
+├── trade_levels.py      # Breakout, TP, profit, loss calculation
+├── database.py          # SQLite persistence and accuracy tracking
+├── .env.example         # Environment template
+└── Dockerfile           # Railway / Docker deployment
 ```
-
----
-
-## Customization
-
-**Change alert threshold:** Set `MIN_SCORE_ALERT` in `.env` (default: 7)
-
-**Change polling frequency:** Adjust `POLL_INTERVAL_*` in `.env`
-
-**Focus alerts on your coins:** Set `FOCUS_SYMBOLS` in `.env` or use `/focus BTC ETH SOL`
-
-**Enable AI analysis:** Set `OPENAI_API_KEY` in `.env` and use `/ai BTC`
-
-**Add new signal types:** Edit `ALL_SIGNAL_TYPES` in `config.py`
-
-**Adjust geo keywords:** Edit `ESCALATION_KEYWORDS` / `DEESCALATION_KEYWORDS` in `geo_module.py`
-
-**Persist SQLite across deploys:** Set `DB_PATH` to a mounted volume path such as `/data/bot_data.db`
-
----
-
-## Cost
-
-| Service | Cost |
-|---------|------|
-| ALTfins API (Starter) | $49/mo |
-| Railway hosting | $5/mo |
-| NewsAPI | Free (100 req/day) |
-| WhatsApp Cloud API | Free (1,000 convos/mo) |
-| Telegram Bot | Free |
-| **Total** | **~$54/mo** |
-
-One good trade pays for a year of this.

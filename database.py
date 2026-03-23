@@ -18,7 +18,6 @@ async def init_db():
                 signal_name TEXT NOT NULL,
                 direction TEXT NOT NULL,
                 score INTEGER NOT NULL,
-                geo_score INTEGER DEFAULT 0,
                 adjusted_score INTEGER NOT NULL,
                 price_at_signal REAL,
                 market_cap REAL,
@@ -34,20 +33,23 @@ async def init_db():
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS geo_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                score INTEGER NOT NULL,
-                headlines TEXT,
-                btc_change_24h REAL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        await db.execute("""
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
         """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_created_at ON signals(created_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_symbol_created_at ON signals(symbol, created_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_signal_key_created_at ON signals(signal_key, created_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_alerted_created_at ON signals(alerted, created_at)"
+        )
         # Default config
         await db.execute(
             "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
@@ -65,7 +67,7 @@ async def init_db():
 
 
 async def log_signal(
-    symbol, signal_key, signal_name, direction, score, geo_score,
+    symbol, signal_key, signal_name, direction, score,
     adjusted_score, price_at_signal, market_cap, screener_data=None, alerted=False
 ):
     now = datetime.now(timezone.utc).isoformat()
@@ -73,10 +75,10 @@ async def log_signal(
         try:
             await db.execute(
                 """INSERT INTO signals
-                   (symbol, signal_key, signal_name, direction, score, geo_score,
+                   (symbol, signal_key, signal_name, direction, score,
                     adjusted_score, price_at_signal, market_cap, screener_data, alerted, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (symbol, signal_key, signal_name, direction, score, geo_score,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (symbol, signal_key, signal_name, direction, score,
                  adjusted_score, price_at_signal, market_cap,
                  json.dumps(screener_data) if screener_data else None,
                  1 if alerted else 0, now),
@@ -85,26 +87,6 @@ async def log_signal(
             return True
         except aiosqlite.IntegrityError:
             return False  # duplicate
-
-
-async def log_geo(score, headlines, btc_change):
-    now = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO geo_log (score, headlines, btc_change_24h, created_at) VALUES (?, ?, ?, ?)",
-            (score, json.dumps(headlines) if headlines else None, btc_change, now),
-        )
-        await db.commit()
-
-
-async def get_last_geo_score():
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT score FROM geo_log ORDER BY id DESC LIMIT 1"
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row["score"] if row else 0
 
 
 async def get_recent_signals(symbol, hours=24):
@@ -120,6 +102,22 @@ async def get_recent_signals(symbol, hours=24):
             return row[0] if row else 0
 
 
+async def has_recent_signal(symbol, signal_key, hours=24):
+    """Persisted dedup check so redeploys do not resend the same setup."""
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT 1
+               FROM signals
+               WHERE symbol = ? AND signal_key = ? AND created_at > ?
+               LIMIT 1""",
+            (symbol, signal_key, cutoff),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
+
+
 async def get_accuracy_stats(days=30):
     """Get signal accuracy stats for the last N days."""
     from datetime import timedelta
@@ -129,6 +127,7 @@ async def get_accuracy_stats(days=30):
         async with db.execute(
             """SELECT signal_key,
                       COUNT(*) as total,
+                      SUM(CASE WHEN hit_tp1 = 1 OR hit_stop = 1 THEN 1 ELSE 0 END) as resolved,
                       SUM(CASE WHEN hit_tp1 = 1 THEN 1 ELSE 0 END) as wins,
                       SUM(CASE WHEN hit_stop = 1 THEN 1 ELSE 0 END) as losses
                FROM signals
@@ -144,7 +143,7 @@ async def get_signals_needing_update():
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            """SELECT id, symbol, price_at_signal, created_at
+            """SELECT id, symbol, price_at_signal, created_at, price_24h, price_72h, price_7d, hit_tp1, hit_stop
                FROM signals
                WHERE alerted = 1 AND (price_24h IS NULL OR price_72h IS NULL OR price_7d IS NULL)
                ORDER BY created_at DESC LIMIT 50"""
@@ -227,3 +226,67 @@ async def get_signal_count_today():
         ) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
+
+
+async def get_signal_key_performance(days=60):
+    """Return recent resolved performance grouped by signal type."""
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT signal_key,
+                      SUM(CASE WHEN hit_tp1 = 1 THEN 1 ELSE 0 END) as wins,
+                      SUM(CASE WHEN hit_stop = 1 THEN 1 ELSE 0 END) as losses,
+                      SUM(CASE WHEN hit_tp1 = 1 OR hit_stop = 1 THEN 1 ELSE 0 END) as resolved
+               FROM signals
+               WHERE alerted = 1 AND created_at > ?
+               GROUP BY signal_key""",
+            (cutoff,),
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+
+    performance = {}
+    for row in rows:
+        resolved = row["resolved"] or 0
+        wins = row["wins"] or 0
+        losses = row["losses"] or 0
+        performance[row["signal_key"].replace(".TXT", "")] = {
+            "wins": wins,
+            "losses": losses,
+            "resolved": resolved,
+            "win_rate": (wins / resolved) if resolved else 0.0,
+        }
+    return performance
+
+
+async def get_symbol_performance(days=45):
+    """Return recent resolved performance grouped by symbol."""
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT symbol,
+                      SUM(CASE WHEN hit_tp1 = 1 THEN 1 ELSE 0 END) as wins,
+                      SUM(CASE WHEN hit_stop = 1 THEN 1 ELSE 0 END) as losses,
+                      SUM(CASE WHEN hit_tp1 = 1 OR hit_stop = 1 THEN 1 ELSE 0 END) as resolved
+               FROM signals
+               WHERE alerted = 1 AND created_at > ?
+               GROUP BY symbol""",
+            (cutoff,),
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+
+    performance = {}
+    for row in rows:
+        resolved = row["resolved"] or 0
+        wins = row["wins"] or 0
+        losses = row["losses"] or 0
+        performance[row["symbol"].upper()] = {
+            "wins": wins,
+            "losses": losses,
+            "resolved": resolved,
+            "win_rate": (wins / resolved) if resolved else 0.0,
+        }
+    return performance

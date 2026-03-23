@@ -12,7 +12,13 @@ def parse_mcap(mcap_str):
     if isinstance(mcap_str, (int, float)):
         return float(mcap_str)
     if isinstance(mcap_str, str):
-        return float(mcap_str.replace(",", "").replace("$", "").strip())
+        cleaned = mcap_str.replace(",", "").replace("$", "").strip()
+        if not cleaned or cleaned == "-":
+            return 0
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0
     return 0
 
 
@@ -34,7 +40,31 @@ def parse_trend_score(trend_str):
     return 5
 
 
-async def score_signal(signal, screener_data=None, geo_score=0):
+def _signal_history_adjustment(resolved, win_rate):
+    if resolved < 6:
+        return 0
+    if win_rate >= 0.67:
+        return 2
+    if win_rate >= 0.55:
+        return 1
+    if win_rate <= 0.33:
+        return -2
+    if win_rate <= 0.45:
+        return -1
+    return 0
+
+
+def _symbol_history_adjustment(resolved, win_rate):
+    if resolved < 4:
+        return 0
+    if win_rate >= 0.60:
+        return 1
+    if win_rate <= 0.40:
+        return -1
+    return 0
+
+
+async def score_signal(signal, screener_data=None, signal_performance=None, symbol_performance=None):
     """
     Score a signal from 0–10 based on:
     1. Signal type weight
@@ -43,9 +73,9 @@ async def score_signal(signal, screener_data=None, geo_score=0):
     4. Volume confirmation
     5. Market cap filter
     6. Confluence bonus (multiple signals same coin)
-    7. Geopolitical adjustment
+    7. Historical edge from tracked outcomes
 
-    Returns (ta_score, adjusted_score, details_dict)
+    Returns (base_score, final_score, details_dict)
     """
     details = {}
     score = 0
@@ -72,18 +102,33 @@ async def score_signal(signal, screener_data=None, geo_score=0):
         # Trend alignment
         med_trend = add_data.get("MEDIUM_TERM_TREND", "")
         short_trend = add_data.get("SHORT_TERM_TREND", "")
+        long_trend = add_data.get("LONG_TERM_TREND", "")
         med_score = parse_trend_score(med_trend)
         short_score = parse_trend_score(short_trend)
+        long_score = parse_trend_score(long_trend)
 
         if med_score >= 7:
             score += 2
             details["med_trend_bonus"] = 2
+        elif med_score <= 3:
+            score -= 1
+            details["med_trend_penalty"] = -1
         if short_score >= 7:
             score += 1
             details["short_trend_bonus"] = 1
+        elif short_score <= 3:
+            score -= 1
+            details["short_trend_penalty"] = -1
+        if long_score >= 7:
+            score += 1
+            details["long_trend_bonus"] = 1
+        elif long_score <= 3:
+            score -= 1
+            details["long_trend_penalty"] = -1
 
         details["medium_trend"] = med_trend
         details["short_trend"] = short_trend
+        details["long_trend"] = long_trend
 
         # RSI sweet spot
         rsi_str = add_data.get("RSI14", "50")
@@ -118,6 +163,9 @@ async def score_signal(signal, screener_data=None, geo_score=0):
         elif vol_rel > 1.3:
             score += 1
             details["volume_bonus"] = 1
+        elif vol_rel < 0.8:
+            score -= 1
+            details["volume_penalty"] = -1
 
     # --- Layer 3: Confluence bonus ---
     symbol = signal.get("symbol", "")
@@ -131,21 +179,35 @@ async def score_signal(signal, screener_data=None, geo_score=0):
         details["confluence_bonus"] = 1
         details["confluence_count"] = recent_count
 
-    # Cap TA score at 10
-    ta_score = min(max(score, 0), 10)
-    details["ta_score"] = ta_score
+    base_score = min(max(score, 0), 10)
+    details["ta_score"] = base_score
 
-    # --- Layer 4: Geopolitical adjustment ---
-    geo_adj = 0
-    if geo_score <= -2:
-        geo_adj = -3
-    elif geo_score == -1:
-        geo_adj = -1
-    elif geo_score >= 2:
-        geo_adj = 1
-    adjusted = min(max(ta_score + geo_adj, 0), 10)
-    details["geo_score"] = geo_score
-    details["geo_adjustment"] = geo_adj
-    details["adjusted_score"] = adjusted
+    # --- Layer 4: Historical edge from tracked outcomes ---
+    history_adjustment = 0
+    signal_stats = (signal_performance or {}).get(signal_key)
+    if signal_stats:
+        signal_adj = _signal_history_adjustment(
+            signal_stats.get("resolved", 0),
+            signal_stats.get("win_rate", 0.0),
+        )
+        history_adjustment += signal_adj
+        details["signal_history_adjustment"] = signal_adj
+        details["signal_history_resolved"] = signal_stats.get("resolved", 0)
+        details["signal_history_win_rate"] = signal_stats.get("win_rate", 0.0)
 
-    return ta_score, adjusted, details
+    symbol_stats = (symbol_performance or {}).get(symbol.upper())
+    if symbol_stats:
+        symbol_adj = _symbol_history_adjustment(
+            symbol_stats.get("resolved", 0),
+            symbol_stats.get("win_rate", 0.0),
+        )
+        history_adjustment += symbol_adj
+        details["symbol_history_adjustment"] = symbol_adj
+        details["symbol_history_resolved"] = symbol_stats.get("resolved", 0)
+        details["symbol_history_win_rate"] = symbol_stats.get("win_rate", 0.0)
+
+    final_score = min(max(base_score + history_adjustment, 0), 10)
+    details["history_adjustment"] = history_adjustment
+    details["adjusted_score"] = final_score
+
+    return base_score, final_score, details

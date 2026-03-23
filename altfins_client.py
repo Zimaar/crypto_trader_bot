@@ -1,4 +1,4 @@
-"""Async ALTfins API client for signals, screener, TA, news, events, and OHLCV."""
+"""Async ALTfins API client for signals, screener snapshots, and OHLCV."""
 
 import httpx
 import logging
@@ -119,58 +119,6 @@ async def screener_symbol(symbol):
     if items:
         return items[0]
     return None
-
-
-# ──────────────────────────────────────────────────────────────
-# Technical Analysis (curated analyst setups)
-# ──────────────────────────────────────────────────────────────
-
-async def get_technical_analysis(symbol=None, size=10):
-    """Get curated analyst trade setups."""
-    params = {"size": size, "sortField": "updatedDate", "sortDirection": "DESC"}
-    if symbol:
-        params["symbol"] = symbol
-    data = await _request("GET", "/api/v2/public/technical-analysis/data", params=params)
-    return _unwrap_content(data)
-
-
-# ──────────────────────────────────────────────────────────────
-# News
-# ──────────────────────────────────────────────────────────────
-
-async def get_news(keywords=None, asset_symbols=None, size=15):
-    """Get crypto news, optionally filtered."""
-    from_dt = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    body = {"fromDate": from_dt}
-    if keywords:
-        body["keywords"] = keywords
-    if asset_symbols:
-        body["assetSymbols"] = [asset_symbols] if isinstance(asset_symbols, str) else asset_symbols
-    data = await _request(
-        "POST",
-        "/api/v2/public/news-summary/search-requests",
-        params={"size": size},
-        json_body=body,
-    )
-    items = _unwrap_content(data)
-    return [
-        {
-            "title": item.get("title", ""),
-            "url": item.get("url", ""),
-            "newsSource": {"name": item.get("sourceName", "?")},
-            "assetSymbols": ", ".join(item.get("assetSymbols", [])) if isinstance(item.get("assetSymbols"), list) else item.get("assetSymbols", ""),
-        }
-        for item in items
-    ]
-
-
-# ──────────────────────────────────────────────────────────────
-# Calendar Events
-# ──────────────────────────────────────────────────────────────
-
-async def get_events(significant_only=True, size=20):
-    """Get upcoming crypto calendar events."""
-    return []
 
 
 # ──────────────────────────────────────────────────────────────

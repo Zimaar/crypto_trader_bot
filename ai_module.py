@@ -31,7 +31,7 @@ def _compact_screener_data(screener_data):
     return {key: add.get(key) for key in keys if add.get(key) not in (None, "")}
 
 
-async def analyze_symbol_setup(symbol, latest_signal=None, screener_data=None, geo_score=0):
+async def analyze_symbol_setup(symbol, latest_signal=None, screener_data=None, market_context=None):
     """Generate a concise AI market read for a symbol."""
     if not client:
         return None
@@ -41,7 +41,11 @@ async def analyze_symbol_setup(symbol, latest_signal=None, screener_data=None, g
         "symbol": symbol,
         "latest_signal": latest_signal or {},
         "screener_data": _compact_screener_data(screener_data or {}),
-        "geo_score": geo_score,
+        "market_context": {
+            "label": (market_context or {}).get("label"),
+            "summary": (market_context or {}).get("summary"),
+            "snapshot": (market_context or {}).get("snapshot"),
+        },
         "trade_plan": {
             "breakout_price": format_price(trade_plan["breakout_price"]),
             "tp_price": format_price(trade_plan["tp_price"]),
@@ -62,6 +66,7 @@ async def analyze_symbol_setup(symbol, latest_signal=None, screener_data=None, g
                         "Use only the supplied data. Do not invent prices, catalysts, or indicators. "
                         "Return plain text with five short lines in this exact order: "
                         "Bias:, Breakout Price:, TP:, Profit/Loss:, Why:. "
+                        "The Breakout Price, TP, and Profit/Loss values must match the supplied trade plan. "
                         "The Profit/Loss line must include both upside and downside in one line. "
                         "Keep the full answer under 120 words."
                     ),
