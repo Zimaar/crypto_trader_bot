@@ -1,7 +1,18 @@
 """BTC-led market context helpers used to tighten alert quality."""
 
+import copy
+import logging
+import time
+
 from altfins_client import screener_symbol
 from signal_scorer import parse_trend_score
+
+logger = logging.getLogger(__name__)
+MARKET_CONTEXT_CACHE_TTL_SECONDS = 120
+_market_context_cache = {
+    "data": None,
+    "ts": 0.0,
+}
 
 
 def _safe_float(value, default=0.0):
@@ -15,8 +26,11 @@ def _default_context():
     return {
         "regime": "neutral",
         "label": "Neutral",
-        "summary": "BTC context is unavailable, so the bot is using its standard confirmation rules.",
-        "snapshot": "BTC context unavailable.",
+        "summary": "BTC tape unavailable. Standard confirmation thresholds stay active.",
+        "snapshot": "BTC tape unavailable.",
+        "tape_line": "BTC Tape: Unavailable",
+        "filter_line": "Filter Active: Min medium trend 5/10, min relative volume 0.90x",
+        "premium_filter_line": "BTC Filter: Neutral | Standard thresholds active",
         "reasons": [],
         "alert_threshold_delta": 0,
         "min_volume_relative": 0.9,
@@ -27,10 +41,36 @@ def _default_context():
     }
 
 
-async def get_market_context():
+def _get_cached_market_context():
+    data = _market_context_cache.get("data")
+    if not data:
+        return None, None
+    age_seconds = time.time() - _market_context_cache["ts"]
+    if age_seconds > MARKET_CONTEXT_CACHE_TTL_SECONDS:
+        return None, age_seconds
+    return copy.deepcopy(data), age_seconds
+
+
+def _set_cached_market_context(context):
+    _market_context_cache["data"] = copy.deepcopy(context)
+    _market_context_cache["ts"] = time.time()
+
+
+async def get_market_context(*, prefer_cache=False):
     """Build a simple BTC-led market regime for alert gating."""
-    screener = await screener_symbol("BTC")
+    cached_context, cached_age = _get_cached_market_context()
+    if prefer_cache and cached_context:
+        return cached_context
+
+    screener_response = await screener_symbol("BTC", prefer_cache=prefer_cache, return_meta=True)
+    screener = (screener_response or {}).get("data")
     if not screener:
+        if cached_context:
+            logger.warning(
+                "Using cached BTC market context from %.0fs ago after ALTfins degradation.",
+                cached_age,
+            )
+            return cached_context
         return _default_context()
 
     add = screener.get("additionalData", screener)
@@ -47,6 +87,10 @@ async def get_market_context():
         "btc_change_1d": change_1d,
         "btc_change_1w": change_1w,
         "reasons": [],
+        "btc_medium_score": medium_score,
+        "btc_long_score": long_score,
+        "btc_medium_trend": medium_trend or "Neutral",
+        "btc_long_trend": long_trend or "Neutral",
     }
 
     bearish_reasons = []
@@ -78,10 +122,9 @@ async def get_market_context():
             "regime": "risk_on",
             "label": "Risk-on",
             "summary": (
-                "BTC trend is supportive"
-                + (f" ({', '.join(bullish_reasons[:2])})" if bullish_reasons else "")
-                + ", so clean breakout setups can alert with standard conviction."
+                "Risk appetite is supportive. Standard breakout thresholds apply."
             ),
+            "premium_filter_line": "BTC Filter: Risk-On | Supportive backdrop",
             "reasons": bullish_reasons,
             "alert_threshold_delta": 0,
             "min_volume_relative": 0.8,
@@ -92,10 +135,11 @@ async def get_market_context():
             "regime": "risk_off",
             "label": "Cautious",
             "summary": (
-                "BTC is guarded right now"
-                + (f" because of {', '.join(bearish_reasons[:2])}" if bearish_reasons else "")
-                + ", so the bot requires stronger trend and volume confirmation before alerting."
+                "Backdrop is cautious."
+                + (f" Pressure shows in {', '.join(bearish_reasons[:2])}." if bearish_reasons else "")
+                + " Only higher-quality trend and liquidity setups qualify."
             ),
+            "premium_filter_line": "BTC Filter: Cautious | Higher confirmation required",
             "reasons": bearish_reasons,
             "alert_threshold_delta": 1,
             "min_volume_relative": 1.1,
@@ -105,16 +149,28 @@ async def get_market_context():
         context.update({
             "regime": "neutral",
             "label": "Neutral",
-            "summary": "BTC is mixed, so the bot waits for solid trend and liquidity confirmation.",
+            "summary": "No broad market tailwind. Trade selection should lean on coin-specific strength.",
+            "premium_filter_line": "BTC Filter: Neutral | Standard thresholds active",
             "alert_threshold_delta": 0,
             "min_volume_relative": 0.9,
             "min_medium_trend": 5,
         })
 
     context["snapshot"] = (
-        f"BTC Medium {medium_trend or 'Neutral'} | Long {long_trend or 'Neutral'}, RSI {rsi:.1f}, "
-        f"1D {change_1d:+.1f}%, 1W {change_1w:+.1f}%"
+        f"BTC Tape: Medium {medium_score}/10 | Long {long_score}/10 | RSI {rsi:.1f} | "
+        f"1D {change_1d:+.1f}% | 1W {change_1w:+.1f}%"
     )
+    context["tape_line"] = context["snapshot"]
+    context["filter_line"] = (
+        f"Filter Active: Min medium trend {context['min_medium_trend']}/10, "
+        f"min relative volume {context['min_volume_relative']:.2f}x"
+    )
+    if screener_response and screener_response.get("source") == "cache":
+        logger.warning(
+            "BTC market context built from cached ALTfins data (%.0fs old).",
+            screener_response.get("age_seconds") or 0,
+        )
+    _set_cached_market_context(context)
     return context
 
 

@@ -1,6 +1,7 @@
 """Telegram bot — commands + notification sender. Your control interface."""
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 
 from telegram import BotCommand, Update
@@ -13,6 +14,8 @@ from config import (
     MIN_SCORE_URGENT,
     ALL_SIGNAL_TYPES,
     ALLOWED_TELEGRAM_USER_IDS,
+    SIGNAL_TYPES_BREAKOUT,
+    SIGNAL_TYPES_MOMENTUM,
 )
 from database import (
     add_focus_symbols,
@@ -27,7 +30,7 @@ from database import (
 )
 from altfins_client import get_signal_feed, screener_symbol
 from ai_module import ai_enabled, analyze_symbol_setup
-from formatters import format_accuracy_report, format_ta_report
+from formatters import format_accuracy_report, format_signal_feed, format_ta_report
 from market_context import get_market_context
 from news_client import get_market_news
 from whatsapp_client import send_whatsapp
@@ -37,6 +40,56 @@ logger = logging.getLogger(__name__)
 app: Application = None
 active_chat_id: str | None = TELEGRAM_CHAT_ID or None
 allowed_user_ids = {str(user_id) for user_id in ALLOWED_TELEGRAM_USER_IDS}
+
+
+def _parse_signal_timestamp(value):
+    if not value:
+        return None
+    cleaned = str(value).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _sort_signals_by_timestamp(signals):
+    return sorted(
+        signals,
+        key=lambda row: _parse_signal_timestamp(row.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+
+def _extract_fresh_signal(signals, freshness_hours=24):
+    sorted_signals = _sort_signals_by_timestamp(signals)
+    if not sorted_signals:
+        return None, "Recent signal: none in the last 24h"
+
+    latest_signal = sorted_signals[0]
+    parsed = _parse_signal_timestamp(latest_signal.get("timestamp"))
+    if not parsed:
+        return latest_signal, None
+
+    age_hours = (datetime.now(timezone.utc) - parsed).total_seconds() / 3600
+    if age_hours <= freshness_hours:
+        return latest_signal, None
+    return None, "Recent signal: none in the last 24h"
+
+
+def _resolve_asset_name(symbol, screener_data=None, recent_signals=None):
+    if screener_data and isinstance(screener_data, dict):
+        for key in ("name", "friendlyName", "symbolName"):
+            value = screener_data.get(key)
+            if value:
+                return value
+    for row in recent_signals or []:
+        value = row.get("name") or row.get("symbolName")
+        if value:
+            return value
+    return symbol
 
 
 async def _get_target_chat_id():
@@ -83,14 +136,14 @@ async def init_telegram():
         active_chat_id = str(stored_chat_id)
 
     commands = [
-        ("scan", "Run a full premium scan now"),
-        ("digest", "Force the market digest now"),
+        ("scan", "Run a full priority scan now"),
+        ("digest", "Send the digest now"),
+        ("feed", "Latest bullish signals feed"),
         ("ta", "Market snapshot for a coin: /ta BTC"),
-        ("ai", "AI analysis for a coin: /ai BTC"),
-        ("accuracy", "Premium alert accuracy stats (30d)"),
-        ("signals", "Premium alerts sent today"),
+        ("accuracy", "Priority alert accuracy stats (30d)"),
+        ("signals", "Priority alerts sent today"),
         ("news", "Latest crypto news: /news or /news BTC"),
-        ("focus", "Manage premium watchlist: /focus show"),
+        ("focus", "Manage focus list: /focus show"),
         ("brief", "Force daily brief now"),
         ("pause", "Pause all alerts"),
         ("resume", "Resume alerts"),
@@ -102,12 +155,12 @@ async def init_telegram():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("feed", cmd_feed))
     app.add_handler(CommandHandler("ta", cmd_ta))
     app.add_handler(CommandHandler("accuracy", cmd_accuracy))
     app.add_handler(CommandHandler("signals", cmd_signals))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CommandHandler("focus", cmd_focus))
-    app.add_handler(CommandHandler("ai", cmd_ai))
     app.add_handler(CommandHandler("brief", cmd_brief))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
@@ -159,8 +212,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "🤖 CryptoEdge Signal Bot — Active\n\n"
-        "I now run two lanes: premium instant alerts for your best setups and a market digest for "
-        "secondary opportunities. Use /focus to manage your premium watchlist and /help for commands."
+        "Use /ta for the current market read, /feed for the latest bullish signals feed, and /focus "
+        "to manage your focus list. /help shows the full command set."
     )
 
 
@@ -169,17 +222,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📋 COMMANDS\n\n"
-        "/scan — Force a full premium scan now\n"
-        "/digest — Force the market digest now\n"
-        "/ta BTC — Market snapshot for any coin\n"
-        "/ai BTC — AI analysis for any coin\n"
-        "/focus — Show premium watchlist\n"
-        "/focus add BTC ETH — Add symbols to premium watchlist\n"
-        "/focus remove BTC ETH — Remove symbols from premium watchlist\n"
-        "/focus set BTC ETH — Replace premium watchlist\n"
-        "/focus clear — Clear premium watchlist and use market-wide sniper mode\n"
-        "/accuracy — Premium alert accuracy stats (30 days)\n"
-        "/signals — Premium alerts sent today\n"
+        "/scan — Force a full priority scan now\n"
+        "/digest — Send the digest now\n"
+        "/feed — Latest bullish signals feed (or /feed BTC)\n"
+        "/ta BTC — Market snapshot with embedded AI when available\n"
+        "/focus — Show focus list\n"
+        "/focus add BTC ETH — Add symbols to focus list\n"
+        "/focus remove BTC ETH — Remove symbols from focus list\n"
+        "/focus set BTC ETH — Replace focus list\n"
+        "/focus clear — Clear focus list and use market-wide mode\n"
+        "/accuracy — Priority alert accuracy stats (30 days)\n"
+        "/signals — Priority alerts sent today\n"
         "/news — Latest crypto headlines (or /news BTC)\n"
         "/brief — Force daily brief now\n"
         "/pause — Pause all alerts\n"
@@ -190,12 +243,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _prepare_private_chat(update):
         return
-    await update.message.reply_text("🔍 Running a full premium scan...")
+    await update.message.reply_text("🔍 Running a full priority scan...")
     from engine import run_full_scan
 
     results = await run_full_scan()
     await update.message.reply_text(
-        f"✅ Scan complete.\nPremium alerts sent: {results['premium_sent']}\nDigest candidates found: {results['digest_candidates']}"
+        f"✅ Scan complete.\nPriority alerts sent: {results['premium_sent']}\nDigest candidates found: {results['digest_candidates']}"
     )
 
 
@@ -209,20 +262,41 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
+async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _prepare_private_chat(update):
+        return
+    symbol = context.args[0].upper() if context.args else None
+    await update.message.reply_text("🧭 Fetching signals feed...")
+
+    rows = await get_signal_feed(
+        SIGNAL_TYPES_BREAKOUT + SIGNAL_TYPES_MOMENTUM,
+        direction="BULLISH",
+        hours_back=24,
+        size=10,
+        symbols=[symbol] if symbol else None,
+        prefer_cache=True,
+    )
+    rows = _sort_signals_by_timestamp(rows)
+    await update.message.reply_text(format_signal_feed(rows, symbol=symbol, limit=10))
+
+
 async def _load_symbol_snapshot(symbol):
-    screener_data, market_context, recent_signals = await asyncio.gather(
-        screener_symbol(symbol),
-        get_market_context(),
+    screener_response, market_context, recent_signals = await asyncio.gather(
+        screener_symbol(symbol, return_meta=True),
+        get_market_context(prefer_cache=True),
         get_signal_feed(
             ALL_SIGNAL_TYPES,
             direction="BULLISH",
-            hours_back=168,
+            hours_back=24,
             size=5,
             symbols=[symbol],
+            prefer_cache=True,
         ),
     )
-    latest_signal = recent_signals[0] if recent_signals else None
-    return screener_data, market_context, latest_signal
+    screener_data = (screener_response or {}).get("data")
+    latest_signal, recent_signal_note = _extract_fresh_signal(recent_signals, freshness_hours=24)
+    snapshot_status = (screener_response or {}).get("source", "unavailable")
+    return screener_data, market_context, latest_signal, recent_signal_note, snapshot_status, recent_signals
 
 
 async def cmd_ta(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,42 +308,16 @@ async def cmd_ta(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     symbol = context.args[0].upper()
     await update.message.reply_text(f"🔍 Building market snapshot for {symbol}...")
-    screener_data, market_context, latest_signal = await _load_symbol_snapshot(symbol)
+    screener_data, market_context, latest_signal, recent_signal_note, snapshot_status, recent_signals = await _load_symbol_snapshot(symbol)
 
-    msg = format_ta_report(
-        ta_data=None,
-        screener_data=screener_data,
-        latest_signal=latest_signal,
-        market_context=market_context,
-    )
-    await update.message.reply_text(msg)
-
-
-async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _prepare_private_chat(update):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /ai BTC")
-        return
-    if not ai_enabled():
-        await update.message.reply_text(
-            "AI analysis is not configured yet. Add OPENAI_API_KEY to .env first."
+    ai_analysis = None
+    if ai_enabled() and screener_data:
+        ai_analysis = await analyze_symbol_setup(
+            symbol=symbol,
+            latest_signal=latest_signal,
+            screener_data=screener_data,
+            market_context=market_context,
         )
-        return
-
-    symbol = context.args[0].upper()
-    await update.message.reply_text(f"🤖 Running AI analysis for {symbol}...")
-    screener_data, market_context, latest_signal = await _load_symbol_snapshot(symbol)
-    ai_analysis = await analyze_symbol_setup(
-        symbol=symbol,
-        latest_signal=latest_signal,
-        screener_data=screener_data,
-        market_context=market_context,
-    )
-
-    if not ai_analysis:
-        await update.message.reply_text("AI analysis is currently unavailable for that symbol.")
-        return
 
     msg = format_ta_report(
         ta_data=None,
@@ -277,6 +325,9 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         latest_signal=latest_signal,
         ai_analysis=ai_analysis,
         market_context=market_context,
+        recent_signal_note=recent_signal_note,
+        snapshot_status=snapshot_status,
+        symbol_hint=_resolve_asset_name(symbol, screener_data=screener_data, recent_signals=recent_signals),
     )
     await update.message.reply_text(msg)
 
@@ -292,7 +343,7 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _prepare_private_chat(update):
         return
     count = await get_signal_count_today()
-    await update.message.reply_text(f"📊 Premium alerts sent today: {count}")
+    await update.message.reply_text(f"📊 Priority alerts sent today: {count}")
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -301,9 +352,33 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = context.args[0].upper() if context.args else None
     await update.message.reply_text("📰 Fetching news...")
 
-    news = await get_market_news(symbol=symbol, limit=8)
+    asset_name = None
+    if symbol:
+        screener_response, recent_signals = await asyncio.gather(
+            screener_symbol(symbol, return_meta=True, prefer_cache=True),
+            get_signal_feed(
+                SIGNAL_TYPES_BREAKOUT + SIGNAL_TYPES_MOMENTUM,
+                direction="BULLISH",
+                hours_back=72,
+                size=3,
+                symbols=[symbol],
+                prefer_cache=True,
+            ),
+        )
+        asset_name = _resolve_asset_name(
+            symbol,
+            screener_data=(screener_response or {}).get("data"),
+            recent_signals=recent_signals,
+        )
+
+    news = await get_market_news(symbol=symbol, asset_name=asset_name, limit=8)
     if not news:
-        await update.message.reply_text("No recent market news found.")
+        if symbol:
+            await update.message.reply_text(
+                f"No coin-specific headlines found for {symbol} in the recent news window."
+            )
+        else:
+            await update.message.reply_text("No recent market news found.")
         return
 
     lines = [f"📰 LATEST NEWS{' — ' + symbol if symbol else ''}", ""]
@@ -322,10 +397,10 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args or args[0] == "SHOW":
         focus = await get_focus_symbols()
         if focus:
-            await update.message.reply_text("🎯 Premium watchlist:\n" + ", ".join(focus))
+            await update.message.reply_text("🎯 Focus list:\n" + ", ".join(focus))
         else:
             await update.message.reply_text(
-                "🎯 Premium watchlist is empty. The bot is using market-wide sniper mode."
+                "🎯 Focus list is empty. The bot is using market-wide mode."
             )
         return
 
@@ -333,7 +408,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if raw_first in {"all", "clear", "off"}:
         focus = await clear_focus_symbols()
         await update.message.reply_text(
-            "🎯 Premium watchlist cleared. The bot is back in market-wide sniper mode."
+            "🎯 Focus list cleared. The bot is back in market-wide mode."
         )
         return
 
@@ -345,7 +420,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Usage: /focus add BTC ETH")
             return
         focus = await add_focus_symbols(symbols)
-        await update.message.reply_text("🎯 Premium watchlist updated:\n" + ", ".join(focus))
+        await update.message.reply_text("🎯 Focus list updated:\n" + ", ".join(focus))
         return
 
     if action == "remove":
@@ -354,10 +429,10 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         focus = await remove_focus_symbols(symbols)
         if focus:
-            await update.message.reply_text("🎯 Premium watchlist updated:\n" + ", ".join(focus))
+            await update.message.reply_text("🎯 Focus list updated:\n" + ", ".join(focus))
         else:
             await update.message.reply_text(
-                "🎯 Premium watchlist is now empty. The bot is using market-wide sniper mode."
+                "🎯 Focus list is now empty. The bot is using market-wide mode."
             )
         return
 
@@ -366,7 +441,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Usage: /focus set BTC ETH")
             return
         focus = await set_focus_symbols(symbols)
-        await update.message.reply_text("🎯 Premium watchlist set to:\n" + ", ".join(focus))
+        await update.message.reply_text("🎯 Focus list set to:\n" + ", ".join(focus))
         return
 
     tokens = [arg for arg in args if arg not in {"SHOW", "ADD", "REMOVE", "SET", "CLEAR"}]
@@ -375,7 +450,7 @@ async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     focus = await set_focus_symbols(tokens)
-    await update.message.reply_text("🎯 Premium watchlist set to:\n" + ", ".join(focus))
+    await update.message.reply_text("🎯 Focus list set to:\n" + ", ".join(focus))
 
 
 async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -384,7 +459,7 @@ async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("☀️ Generating daily brief...")
     from engine import generate_daily_brief
 
-    msg = await generate_daily_brief()
+    msg = await generate_daily_brief(send=False)
     await update.message.reply_text(msg)
 
 

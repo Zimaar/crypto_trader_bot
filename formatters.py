@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 
+from signal_scorer import parse_trend_score
 from trade_levels import build_trade_plan, format_percent, format_price
 
 
@@ -100,19 +101,61 @@ def _append_history_edge(lines, score_details):
     lines.extend(history_lines)
 
 
-def _append_market_context(lines, market_context):
-    """Append BTC market context without turning it into a score."""
+def _format_filter_check(market_context, screener_data=None, gate_passed=None, gate_reasons=None):
+    if gate_passed is not None:
+        if gate_passed:
+            return "✅ Filter Check: Pass"
+        if gate_reasons:
+            return f"⚠️ Filter Check: Fail — {'; '.join(gate_reasons)}"
+        return "⚠️ Filter Check: Fail"
+
+    if not market_context or not screener_data:
+        return None
+
+    add = screener_data.get("additionalData", screener_data)
+    medium_score = parse_trend_score(add.get("MEDIUM_TERM_TREND", ""))
+    try:
+        volume_relative = float(add.get("VOLUME_RELATIVE", 1.0))
+    except (TypeError, ValueError):
+        volume_relative = 1.0
+
+    reasons = []
+    min_medium = market_context.get("min_medium_trend", 5)
+    min_volume = market_context.get("min_volume_relative", 0.9)
+    if medium_score < min_medium:
+        reasons.append(f"medium trend {medium_score}/10 < {min_medium}/10")
+    if volume_relative < min_volume:
+        reasons.append(f"relative volume {volume_relative:.2f}x < {min_volume:.2f}x")
+
+    if reasons:
+        return f"⚠️ Filter Check: Fail — {'; '.join(reasons)}"
+    return "✅ Filter Check: Pass"
+
+
+def _append_market_context(lines, market_context, screener_data=None, gate_passed=None, gate_reasons=None):
+    """Append trader-facing BTC market filter context."""
     if not market_context:
         return
 
     lines.append("")
-    lines.append(f"🧭 Market Context: {market_context.get('label', 'Neutral')}")
-    snapshot = market_context.get("snapshot")
-    summary = market_context.get("summary")
-    if snapshot:
-        lines.append(f"├ {snapshot}")
-    if summary:
-        lines.append(f"└ {summary}")
+    block = [
+        f"🧭 Market Filter: {market_context.get('label', 'Neutral')}",
+        f"├ {market_context.get('tape_line') or market_context.get('snapshot') or 'BTC Tape: Unavailable'}",
+        f"├ Market Read: {market_context.get('summary', 'Standard confirmation thresholds stay active.')}",
+        f"├ {market_context.get('filter_line', 'Filter Active: Min medium trend 5/10, min relative volume 0.90x')}",
+    ]
+    filter_check = _format_filter_check(
+        market_context,
+        screener_data=screener_data,
+        gate_passed=gate_passed,
+        gate_reasons=gate_reasons,
+    )
+    if filter_check:
+        block.append(f"└ {filter_check}")
+    else:
+        block[-1] = block[-1].replace("├", "└", 1)
+
+    lines.extend(block)
 
 
 def _append_why_this_passed(lines, score_details, alert_lane, lane_reason, rank):
@@ -123,7 +166,7 @@ def _append_why_this_passed(lines, score_details, alert_lane, lane_reason, rank)
     ta_score = score_details.get("ta_score", 0)
     final_score = score_details.get("adjusted_score", ta_score)
     history_adj = score_details.get("history_adjustment", 0)
-    market_snapshot = score_details.get("market_context_snapshot")
+    premium_filter_line = score_details.get("market_context_premium_line")
     gate_reasons = score_details.get("gate_reasons") or []
 
     block = []
@@ -131,9 +174,9 @@ def _append_why_this_passed(lines, score_details, alert_lane, lane_reason, rank)
         block.append(f"Rank in scan: #{rank}")
     block.append(f"Setup: {setup_type}")
     block.append(f"Score: {final_score}/10 (TA {ta_score} + Hist {history_adj:+d})")
-    block.append(f"Lane: {lane_reason or 'premium'}")
-    if market_snapshot:
-        block.append(f"BTC Context: {market_snapshot}")
+    block.append(f"Route: {lane_reason or 'priority'}")
+    if premium_filter_line:
+        block.append(premium_filter_line)
     if gate_reasons:
         block.append(f"Gate Notes: {', '.join(gate_reasons)}")
     else:
@@ -181,7 +224,7 @@ def format_signal_alert(
         label = "SIGNAL"
 
     if alert_lane == "premium":
-        heading = f"{emoji} PREMIUM {label} — {symbol} ({name}) — ${price}"
+        heading = f"{emoji} PRIORITY {label} — {symbol} ({name}) — ${price}"
     else:
         heading = f"{emoji} {label} — {symbol} ({name}) — ${price}"
 
@@ -232,11 +275,17 @@ def format_signal_alert(
 
     lines.append("")
     _append_trade_plan(lines, signal, screener_data)
-    _append_market_context(lines, market_context)
+    _append_market_context(
+        lines,
+        market_context,
+        screener_data=screener_data,
+        gate_passed=score_details.get("gate_passed"),
+        gate_reasons=score_details.get("gate_reasons"),
+    )
 
     if ai_analysis:
         lines.append("")
-        lines.append("🤖 AI View:")
+        lines.append("🤖 AI Read:")
         lines.append(ai_analysis)
 
     now = datetime.now(timezone.utc).strftime("%b %d, %Y %I:%M %p UTC")
@@ -246,12 +295,21 @@ def format_signal_alert(
     return "\n".join(lines)
 
 
-def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysis=None, market_context=None):
+def format_ta_report(
+    ta_data,
+    screener_data=None,
+    latest_signal=None,
+    ai_analysis=None,
+    market_context=None,
+    recent_signal_note=None,
+    snapshot_status="live",
+    symbol_hint=None,
+):
     """Format a technical analysis report for /ta command."""
-    if not ta_data and not screener_data and not latest_signal:
-        return "No current market snapshot found for this symbol."
+    if not ta_data and not screener_data and not latest_signal and not symbol_hint:
+        return "Live snapshot unavailable from ALTfins."
 
-    symbol = "?"
+    symbol = symbol_hint or "?"
     name = symbol
 
     if latest_signal:
@@ -293,6 +351,10 @@ def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysi
             f"📊 MARKET SNAPSHOT — {symbol} ({name})",
             "",
         ])
+        if snapshot_status == "cache":
+            lines.append("📦 Snapshot: Cached ALTfins data from the recent fallback window.")
+        elif snapshot_status == "unavailable":
+            lines.append("⚠️ Live snapshot unavailable from ALTfins.")
         if latest_signal:
             signal_name = latest_signal.get("signalName", latest_signal.get("signalKey", "?"))
             direction = latest_signal.get("direction", "?")
@@ -306,18 +368,23 @@ def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysi
             price = screener_data.get("lastPrice")
             if price not in (None, ""):
                 lines.append(f"💵 Last Price: ${price}")
+        if recent_signal_note and not latest_signal:
+            lines.append(f"📡 {recent_signal_note}")
 
     if screener_data:
         lines.append("")
         _append_indicator_lines(lines, screener_data)
 
-    lines.append("")
-    _append_trade_plan(lines, latest_signal, screener_data)
-    _append_market_context(lines, market_context)
+    if screener_data:
+        lines.append("")
+        _append_trade_plan(lines, latest_signal, screener_data)
+        _append_market_context(lines, market_context, screener_data=screener_data)
+    elif market_context:
+        _append_market_context(lines, market_context)
 
     if ai_analysis:
         lines.append("")
-        lines.append("🤖 AI View:")
+        lines.append("🤖 AI Read:")
         lines.append(ai_analysis)
 
     return "\n".join(lines)
@@ -326,9 +393,9 @@ def format_ta_report(ta_data, screener_data=None, latest_signal=None, ai_analysi
 def format_market_digest(watchlist_candidates, market_candidates, market_context=None):
     """Format the scheduled or manual market digest."""
     if not watchlist_candidates and not market_candidates:
-        return "📬 MARKET DIGEST\n\nNo high-conviction watchlist or market opportunities right now."
+        return "📬 DIGEST\n\nNo priority setups in this digest window."
 
-    lines = ["📬 MARKET DIGEST"]
+    lines = ["📬 DIGEST"]
     _append_market_context(lines, market_context)
 
     def add_section(title, candidates):
@@ -347,8 +414,8 @@ def format_market_digest(watchlist_candidates, market_candidates, market_context
                 f"| Breakout {format_price(trade_plan.get('breakout_price'))}"
             )
 
-    add_section("🎯 Watchlist Opportunities", watchlist_candidates)
-    add_section("🌐 Market Opportunities", market_candidates)
+    add_section("🎯 Focus List", watchlist_candidates)
+    add_section("🌐 Market", market_candidates)
     return "\n".join(lines)
 
 
@@ -373,20 +440,26 @@ def format_setup_lifecycle_update(setup, status, latest_price):
     return "\n".join(lines)
 
 
-def format_daily_brief(signals_today, market_context, headlines=None):
+def format_daily_brief(signals_today, market_context, headlines=None, as_of=None):
     """Format the morning daily brief."""
-    now = datetime.now(timezone.utc).strftime("%b %d, %Y")
+    reference_time = as_of or datetime.now(timezone.utc)
+    now = reference_time.strftime("%b %d, %Y")
     lines = [
         f"☀️ DAILY BRIEF — {now}",
         "",
-        f"🧭 Market Context: {(market_context or {}).get('label', 'Neutral')}",
+        f"🧭 Market Filter: {(market_context or {}).get('label', 'Neutral')}",
     ]
-    snapshot = (market_context or {}).get("snapshot")
+    snapshot = (market_context or {}).get("tape_line") or (market_context or {}).get("snapshot")
     summary = (market_context or {}).get("summary")
+    filter_line = (market_context or {}).get("filter_line")
     if snapshot:
         lines.append(f"├ {snapshot}")
     if summary:
-        lines.append(f"└ {summary}")
+        lines.append(f"├ Market Read: {summary}")
+    if filter_line:
+        lines.append(f"└ {filter_line}")
+    elif len(lines) > 1:
+        lines[-1] = lines[-1].replace("├", "└", 1)
     lines.append("")
 
     if headlines:
@@ -406,6 +479,23 @@ def format_daily_brief(signals_today, market_context, headlines=None):
     else:
         lines.append("📭 No high-quality signals in the last 24h.")
 
+    return "\n".join(lines)
+
+
+def format_signal_feed(signals, symbol=None, limit=10):
+    """Format the latest bullish ALTfins signals feed rows."""
+    if not signals:
+        return f"🧭 SIGNALS FEED{' — ' + symbol if symbol else ''}\n\nNo recent bullish feed entries."
+
+    lines = [f"🧭 SIGNALS FEED{' — ' + symbol if symbol else ''}"]
+    for signal in signals[:limit]:
+        timestamp = str(signal.get("timestamp", ""))[:16].replace("T", " ")
+        symbol_name = signal.get("symbol", "?")
+        signal_name = signal.get("signalName", signal.get("signalKey", "?"))
+        price = signal.get("lastPrice")
+        price_text = f"${price}" if price not in (None, "") else "N/A"
+        parts = [timestamp + " UTC" if timestamp else None, symbol_name, signal_name, price_text]
+        lines.append("• " + " | ".join(part for part in parts if part))
     return "\n".join(lines)
 
 

@@ -45,6 +45,7 @@ async def analyze_symbol_setup(symbol, latest_signal=None, screener_data=None, m
             "label": (market_context or {}).get("label"),
             "summary": (market_context or {}).get("summary"),
             "snapshot": (market_context or {}).get("snapshot"),
+            "filter_line": (market_context or {}).get("filter_line"),
         },
         "trade_plan": {
             "breakout_price": format_price(trade_plan["breakout_price"]),
@@ -68,6 +69,11 @@ async def analyze_symbol_setup(symbol, latest_signal=None, screener_data=None, m
                         "Bias:, Breakout Price:, TP:, Profit/Loss:, Why:. "
                         "The Breakout Price, TP, and Profit/Loss values must match the supplied trade plan. "
                         "The Profit/Loss line must include both upside and downside in one line. "
+                        "When referencing BTC context, use trader language such as 'BTC filter is Neutral' or "
+                        "'supportive backdrop' and explain whether the setup depends on coin-specific strength "
+                        "or benefits from market tailwind. "
+                        "Do not use phrases like 'mixed market', 'the bot waits', 'currently', 'right now', or "
+                        "'at the moment'. "
                         "Keep the full answer under 120 words."
                     ),
                 },

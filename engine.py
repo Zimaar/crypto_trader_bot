@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timezone
 import logging
+from zoneinfo import ZoneInfo
 
 from config import (
     ALL_SIGNAL_TYPES,
@@ -20,6 +21,7 @@ from config import (
     DIGEST_SYMBOL_SUPPRESSION_HOURS,
     DIGEST_SCORE_IMPROVEMENT_THRESHOLD,
     MAX_DIGEST_CANDIDATES,
+    TIMEZONE,
 )
 from altfins_client import get_signal_feed, screener_symbol, get_latest_price, get_latest_prices
 from ai_module import analyze_symbol_setup
@@ -37,6 +39,7 @@ from database import (
     has_recent_signal,
     log_digest_candidates,
     log_signal,
+    set_config,
     update_managed_setup,
     update_signal_prices,
 )
@@ -88,6 +91,10 @@ def _premium_sort_key(candidate):
     )
 
 
+def _local_now():
+    return datetime.now(ZoneInfo(TIMEZONE))
+
+
 def _best_candidates_by_symbol(candidates):
     best = {}
     for candidate in candidates:
@@ -122,15 +129,15 @@ def _is_premium_eligible(candidate, has_focus_symbols):
         if not candidate["is_focus"]:
             return False, None
         if setup_type == "breakout" and score >= 7 and medium_score >= 6 and volume_relative >= 1.2:
-            return True, "focus watchlist"
+            return True, "Focus list"
         if setup_type == "momentum" and score >= 8 and medium_score >= 7 and volume_relative >= 1.5:
-            return True, "focus watchlist"
+            return True, "Focus list"
         return False, None
 
     if setup_type == "breakout" and score >= 8:
-        return True, "market-wide elite"
+        return True, "Market-wide"
     if setup_type == "momentum" and score >= 9:
-        return True, "market-wide elite"
+        return True, "Market-wide"
     return False, None
 
 
@@ -247,6 +254,7 @@ async def _prepare_candidates(
         details["gate_passed"] = gate_passed
         details["gate_reasons"] = gate_reasons
         details["market_context_snapshot"] = (market_context or {}).get("snapshot")
+        details["market_context_premium_line"] = (market_context or {}).get("premium_filter_line")
 
         candidates.append(candidate)
 
@@ -365,7 +373,7 @@ async def process_signals(signals, market_context, signal_performance, symbol_pe
             )
 
         logger.info(
-            "PREMIUM ALERT: %s — %s — Score %s — %s",
+            "PRIORITY ALERT: %s — %s — Score %s — %s",
             candidate["symbol"],
             candidate["signal_key"],
             candidate["final_score"],
@@ -496,6 +504,23 @@ async def generate_market_digest(send=True):
     return msg
 
 
+async def _claim_scheduled_slot(config_key, slot_value):
+    existing = await get_config(config_key)
+    if existing == slot_value:
+        logger.info("Skipping duplicate scheduled send for %s slot %s.", config_key, slot_value)
+        return False
+    await set_config(config_key, slot_value)
+    return True
+
+
+async def send_scheduled_market_digest():
+    """Send the fixed-time digest once per scheduled slot."""
+    slot_value = _local_now().strftime("%Y-%m-%dT%H")
+    if not await _claim_scheduled_slot("last_digest_slot", slot_value):
+        return None
+    return await generate_market_digest(send=True)
+
+
 async def monitor_managed_setups():
     """Check premium setups and send lifecycle follow-ups."""
     active_setups = await get_active_managed_setups()
@@ -608,7 +633,7 @@ async def update_accuracy():
     logger.info("Updated accuracy for %s signals.", len(signals))
 
 
-async def generate_daily_brief():
+async def generate_daily_brief(send=True):
     """Generate and send the morning daily brief."""
     market_context, signal_performance, symbol_performance = await _build_scan_context()
     signals, news = await asyncio.gather(
@@ -633,9 +658,23 @@ async def generate_daily_brief():
         signal["adjusted_score"] = candidate["final_score"]
         top_signals.append(signal)
 
-    msg = format_daily_brief(top_signals, market_context, summarize_headlines(news, limit=3))
-    await notify(msg, score=0)
+    msg = format_daily_brief(
+        top_signals,
+        market_context,
+        summarize_headlines(news, limit=3),
+        as_of=_local_now(),
+    )
+    if send:
+        await notify(msg, score=0)
     return msg
+
+
+async def send_scheduled_daily_brief():
+    """Send the morning brief once per Dubai trading day."""
+    slot_value = _local_now().strftime("%Y-%m-%d")
+    if not await _claim_scheduled_slot("last_brief_slot", slot_value):
+        return None
+    return await generate_daily_brief(send=True)
 
 
 async def cleanup_dedup_cache():

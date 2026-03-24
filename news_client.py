@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
+import re
 from urllib.parse import urlparse
 
 import feedparser
@@ -59,22 +60,57 @@ LOW_SIGNAL_PATTERNS = {
 }
 
 
-def _matches_symbol(text, symbol):
-    if not symbol:
+def _normalize_alias_variants(value):
+    if not value:
+        return []
+    raw = str(value).strip().lower()
+    if not raw:
+        return []
+    spaced = re.sub(r"[^a-z0-9]+", " ", raw).strip()
+    collapsed = spaced.replace(" ", "")
+    variants = [raw]
+    if spaced and spaced not in variants:
+        variants.append(spaced)
+    if collapsed and collapsed not in variants:
+        variants.append(collapsed)
+    return variants
+
+
+def _build_symbol_aliases(symbol=None, asset_name=None):
+    if not symbol and not asset_name:
+        return []
+    aliases = []
+    seen = set()
+    for item in SYMBOL_ALIASES.get((symbol or "").upper(), []):
+        for variant in _normalize_alias_variants(item):
+            if variant and variant not in seen:
+                seen.add(variant)
+                aliases.append(variant)
+    for item in [symbol, asset_name]:
+        for variant in _normalize_alias_variants(item):
+            if variant and variant not in seen:
+                seen.add(variant)
+                aliases.append(variant)
+    aliases.sort(key=len, reverse=True)
+    return aliases
+
+
+def _matches_symbol(text, symbol=None, aliases=None):
+    if not symbol and not aliases:
         return True
     haystack = (text or "").lower()
-    aliases = SYMBOL_ALIASES.get(symbol.upper(), [symbol.lower()])
-    return any(alias in haystack for alias in aliases)
+    candidate_aliases = aliases or _build_symbol_aliases(symbol)
+    return any(alias in haystack for alias in candidate_aliases)
 
 
-def _build_newsapi_query(symbol=None, keywords=None):
+def _build_newsapi_query(symbol=None, asset_name=None, keywords=None, aliases=None):
     if keywords:
         if isinstance(keywords, (list, tuple)):
             return " OR ".join(str(item).strip() for item in keywords if str(item).strip())
         return str(keywords).strip()
     if symbol:
-        aliases = SYMBOL_ALIASES.get(symbol.upper(), [symbol.lower(), symbol.upper()])
-        alias_query = " OR ".join(f'"{alias}"' for alias in aliases)
+        alias_values = aliases or _build_symbol_aliases(symbol, asset_name=asset_name)
+        alias_query = " OR ".join(f'"{alias}"' for alias in alias_values[:6])
         return f"({alias_query}) AND (crypto OR token OR blockchain)"
     return "(crypto OR bitcoin OR ethereum OR altcoin) AND (market OR price OR breakout OR rally OR etf OR liquidity)"
 
@@ -120,7 +156,7 @@ def _parse_published_at(value):
         return None
 
 
-def _is_article_relevant(article, symbol=None):
+def _is_article_relevant(article, symbol=None, aliases=None):
     source = (article.get("source", "") or "").lower()
     domain = _extract_domain(article.get("url", ""))
     text = f" {_text_blob(article)} "
@@ -131,7 +167,7 @@ def _is_article_relevant(article, symbol=None):
         return False
     if _contains_any(text, LOW_SIGNAL_PATTERNS):
         return False
-    if symbol and not _matches_symbol(text, symbol):
+    if symbol and not _matches_symbol(text, symbol=symbol, aliases=aliases):
         return False
 
     has_crypto = _contains_any(text, CRYPTO_TERMS)
@@ -143,8 +179,8 @@ def _is_article_relevant(article, symbol=None):
     return has_crypto or (has_macro and has_market)
 
 
-def _score_article(article, symbol=None):
-    if not _is_article_relevant(article, symbol=symbol):
+def _score_article(article, symbol=None, aliases=None):
+    if not _is_article_relevant(article, symbol=symbol, aliases=aliases):
         return None
 
     source = (article.get("source", "") or "").lower()
@@ -156,7 +192,7 @@ def _score_article(article, symbol=None):
     elif source:
         score += 1
 
-    if symbol and _matches_symbol(text, symbol):
+    if symbol and _matches_symbol(text, symbol=symbol, aliases=aliases):
         score += 4
 
     score += sum(1 for term in CRYPTO_TERMS if term in text)
@@ -174,10 +210,11 @@ def _score_article(article, symbol=None):
     return score
 
 
-def _rank_news(items, symbol=None, limit=8):
+def _rank_news(items, symbol=None, asset_name=None, limit=8):
+    aliases = _build_symbol_aliases(symbol, asset_name=asset_name)
     scored = []
     for item in _dedupe_news(items):
-        score = _score_article(item, symbol=symbol)
+        score = _score_article(item, symbol=symbol, aliases=aliases)
         if score is None:
             continue
         item["relevance_score"] = round(score, 2)
@@ -197,12 +234,13 @@ def _utc_now():
     return datetime.now(timezone.utc)
 
 
-async def _fetch_newsapi(symbol=None, keywords=None, limit=20):
+async def _fetch_newsapi(symbol=None, asset_name=None, keywords=None, limit=20):
     if not NEWSAPI_KEY:
         return []
 
+    aliases = _build_symbol_aliases(symbol, asset_name=asset_name)
     params = {
-        "q": _build_newsapi_query(symbol=symbol, keywords=keywords),
+        "q": _build_newsapi_query(symbol=symbol, asset_name=asset_name, keywords=keywords, aliases=aliases),
         "language": "en",
         "sortBy": "publishedAt",
         "pageSize": max(limit, 10),
@@ -270,15 +308,20 @@ async def _fetch_rss(symbol=None, limit=20):
     return articles
 
 
-async def get_market_news(symbol=None, keywords=None, limit=8):
+async def get_market_news(symbol=None, asset_name=None, keywords=None, limit=8):
     """Fetch and rank market news for /news and briefing output."""
-    raw_newsapi = await _fetch_newsapi(symbol=symbol, keywords=keywords, limit=limit * 3)
-    ranked_newsapi = _rank_news(raw_newsapi, symbol=symbol, limit=limit)
+    raw_newsapi = await _fetch_newsapi(
+        symbol=symbol,
+        asset_name=asset_name,
+        keywords=keywords,
+        limit=limit * 3,
+    )
+    ranked_newsapi = _rank_news(raw_newsapi, symbol=symbol, asset_name=asset_name, limit=limit)
     if ranked_newsapi:
         return ranked_newsapi
 
     raw_rss = await _fetch_rss(symbol=symbol, limit=limit * 3)
-    return _rank_news(raw_rss, symbol=symbol, limit=limit)
+    return _rank_news(raw_rss, symbol=symbol, asset_name=asset_name, limit=limit)
 
 
 def summarize_headlines(articles, limit=3):

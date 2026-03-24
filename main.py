@@ -1,7 +1,7 @@
 """
 CryptoEdge Signal Bot — Main Entry Point
 =========================================
-Premium watchlist alerts + market digest + lifecycle follow-ups → Telegram/WhatsApp
+Priority alerts + digest + lifecycle follow-ups → Telegram/WhatsApp
 
 Run: python main.py
 Deploy: Railway / VPS / Docker
@@ -10,6 +10,7 @@ Deploy: Railway / VPS / Docker
 import asyncio
 import logging
 import sys
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -20,18 +21,18 @@ from config import (
     TELEGRAM_BOT_TOKEN,
     POLL_INTERVAL_SIGNALS,
     TIMEZONE,
-    MARKET_DIGEST_INTERVAL_HOURS,
     LIFECYCLE_POLL_INTERVAL_SECONDS,
 )
 from database import init_db
 from engine import (
     cleanup_dedup_cache,
-    generate_daily_brief,
-    generate_market_digest,
+    get_market_context,
     monitor_managed_setups,
     scan_breakouts,
     scan_momentum,
     scan_pullbacks,
+    send_scheduled_daily_brief,
+    send_scheduled_market_digest,
     update_accuracy,
 )
 from telegram_bot import init_telegram, send_telegram
@@ -69,7 +70,8 @@ async def main():
     await init_telegram()
     logger.info("Telegram bot connected.")
 
-    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    local_tz = ZoneInfo(TIMEZONE)
+    scheduler = AsyncIOScheduler(timezone=local_tz)
     scheduler.add_job(
         scan_breakouts,
         IntervalTrigger(seconds=180),
@@ -92,10 +94,11 @@ async def main():
         misfire_grace_time=60,
     )
     scheduler.add_job(
-        generate_market_digest,
-        IntervalTrigger(hours=MARKET_DIGEST_INTERVAL_HOURS),
+        send_scheduled_market_digest,
+        CronTrigger(hour="11,15,19,23", minute=0, timezone=local_tz),
         id="market_digest",
         max_instances=1,
+        misfire_grace_time=900,
     )
     scheduler.add_job(
         monitor_managed_setups,
@@ -104,25 +107,34 @@ async def main():
         max_instances=1,
     )
     scheduler.add_job(update_accuracy, IntervalTrigger(hours=6), id="accuracy", max_instances=1)
-    scheduler.add_job(generate_daily_brief, CronTrigger(hour=7, minute=0), id="daily_brief")
-    scheduler.add_job(cleanup_dedup_cache, CronTrigger(hour=0, minute=0), id="cleanup")
+    scheduler.add_job(
+        send_scheduled_daily_brief,
+        CronTrigger(hour=7, minute=0, timezone=local_tz),
+        id="daily_brief",
+        misfire_grace_time=900,
+    )
+    scheduler.add_job(
+        cleanup_dedup_cache,
+        CronTrigger(hour=0, minute=0, timezone=local_tz),
+        id="cleanup",
+    )
 
     scheduler.start()
     logger.info("Scheduler started with all jobs.")
 
     await send_telegram(
         "🤖 CryptoEdge Signal Bot — ONLINE\n\n"
-        "Premium lane: Breakouts (3m), Momentum (5m)\n"
-        "Market digest: Every 4h\n"
+        "Priority scans: Breakouts (3m), Momentum (5m)\n"
+        "Digest: 11:00, 15:00, 19:00, 23:00 GST\n"
         "Lifecycle tracking: Every 15m\n"
         "Daily brief: 7:00 AM GST\n\n"
         "Use /help for commands."
     )
 
-    logger.info("Running initial scans...")
+    logger.info("Warming caches and running initial scan...")
+    await get_market_context(prefer_cache=False)
     await scan_breakouts()
-    await generate_market_digest()
-    logger.info("Initial scans complete.")
+    logger.info("Startup warm-up complete.")
 
     try:
         while True:
