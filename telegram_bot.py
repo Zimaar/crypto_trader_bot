@@ -38,7 +38,8 @@ from whatsapp_client import send_whatsapp
 logger = logging.getLogger(__name__)
 
 app: Application = None
-active_chat_id: str | None = TELEGRAM_CHAT_ID or None
+fixed_chat_id: str | None = TELEGRAM_CHAT_ID or None
+active_chat_id: str | None = fixed_chat_id
 allowed_user_ids = {str(user_id) for user_id in ALLOWED_TELEGRAM_USER_IDS}
 
 
@@ -94,6 +95,8 @@ def _resolve_asset_name(symbol, screener_data=None, recent_signals=None):
 
 async def _get_target_chat_id():
     global active_chat_id
+    if fixed_chat_id:
+        return str(fixed_chat_id)
     if active_chat_id:
         return str(active_chat_id)
     stored_chat_id = await get_config("telegram_chat_id")
@@ -108,6 +111,8 @@ async def _remember_chat_from_update(update: Update):
     if not update or not update.effective_chat:
         return
     if getattr(update.effective_chat, "type", "") != "private":
+        return
+    if fixed_chat_id:
         return
     chat_id = str(update.effective_chat.id)
     if chat_id == active_chat_id:
@@ -131,9 +136,12 @@ async def _prepare_private_chat(update: Update):
 async def init_telegram():
     global app, active_chat_id
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    stored_chat_id = await get_config("telegram_chat_id")
-    if stored_chat_id:
-        active_chat_id = str(stored_chat_id)
+    if fixed_chat_id:
+        active_chat_id = str(fixed_chat_id)
+    else:
+        stored_chat_id = await get_config("telegram_chat_id")
+        if stored_chat_id:
+            active_chat_id = str(stored_chat_id)
 
     commands = [
         ("scan", "Run a full priority scan now"),
