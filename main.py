@@ -19,7 +19,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 from config import (
     ALTFINS_API_KEY,
     TELEGRAM_BOT_TOKEN,
-    POLL_INTERVAL_SIGNALS,
+    POLL_INTERVAL_BREAKOUTS_SECONDS,
+    POLL_INTERVAL_MOMENTUM_SECONDS,
+    PULLBACK_POLLING_ENABLED,
     TIMEZONE,
     LIFECYCLE_POLL_INTERVAL_SECONDS,
 )
@@ -30,7 +32,6 @@ from engine import (
     monitor_managed_setups,
     scan_breakouts,
     scan_momentum,
-    scan_pullbacks,
     send_scheduled_daily_brief,
     send_scheduled_market_digest,
     update_accuracy,
@@ -74,25 +75,28 @@ async def main():
     scheduler = AsyncIOScheduler(timezone=local_tz)
     scheduler.add_job(
         scan_breakouts,
-        IntervalTrigger(seconds=180),
+        IntervalTrigger(seconds=POLL_INTERVAL_BREAKOUTS_SECONDS),
         id="breakouts",
         max_instances=1,
         misfire_grace_time=60,
     )
     scheduler.add_job(
         scan_momentum,
-        IntervalTrigger(seconds=POLL_INTERVAL_SIGNALS),
+        IntervalTrigger(seconds=POLL_INTERVAL_MOMENTUM_SECONDS),
         id="momentum",
         max_instances=1,
         misfire_grace_time=60,
     )
-    scheduler.add_job(
-        scan_pullbacks,
-        IntervalTrigger(seconds=600),
-        id="pullbacks",
-        max_instances=1,
-        misfire_grace_time=60,
-    )
+    if PULLBACK_POLLING_ENABLED:
+        from engine import scan_pullbacks
+
+        scheduler.add_job(
+            scan_pullbacks,
+            IntervalTrigger(seconds=600),
+            id="pullbacks",
+            max_instances=1,
+            misfire_grace_time=60,
+        )
     scheduler.add_job(
         send_scheduled_market_digest,
         CronTrigger(hour="11,15,19,23", minute=0, timezone=local_tz),
@@ -124,7 +128,9 @@ async def main():
 
     await send_telegram(
         "🤖 CryptoEdge Signal Bot — ONLINE\n\n"
-        "Priority scans: Breakouts (3m), Momentum (5m)\n"
+        f"Priority scans: Breakouts ({POLL_INTERVAL_BREAKOUTS_SECONDS // 60}m), "
+        f"Momentum ({POLL_INTERVAL_MOMENTUM_SECONDS // 60}m)\n"
+        f"Pullback polling: {'On' if PULLBACK_POLLING_ENABLED else 'Off'}\n"
         "Digest: 11:00, 15:00, 19:00, 23:00 GST\n"
         "Lifecycle tracking: Every 15m\n"
         "Daily brief: 7:00 AM GST\n\n"
