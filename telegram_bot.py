@@ -279,7 +279,7 @@ async def _load_feed_rows(symbol=None, *, hours_back=72, size=30):
     return _sort_signals_by_timestamp(rows)
 
 
-async def _load_feed_screener_map(rows, limit=12):
+async def _load_feed_screener_map(rows, limit=12, allow_live=False):
     symbols = []
     seen = set()
     for row in rows:
@@ -296,7 +296,12 @@ async def _load_feed_screener_map(rows, limit=12):
 
     screener_rows = await asyncio.gather(
         *[
-            screener_symbol(symbol, return_meta=True, prefer_cache=True)
+            screener_symbol(
+                symbol,
+                return_meta=True,
+                prefer_cache=True,
+                cache_only=not allow_live,
+            )
             for symbol in symbols
         ]
     )
@@ -312,7 +317,7 @@ async def _send_signals_feed(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("🧭 Fetching ALTfins signals...")
 
     rows = await _load_feed_rows(symbol=symbol, hours_back=72, size=30)
-    screener_by_symbol = await _load_feed_screener_map(rows, limit=12)
+    screener_by_symbol = await _load_feed_screener_map(rows, limit=12, allow_live=bool(symbol))
     await update.message.reply_text(
         format_signal_feed(rows, symbol=symbol, limit=12, screener_by_symbol=screener_by_symbol)
     )

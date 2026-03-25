@@ -9,6 +9,7 @@ from signal_scorer import parse_trend_score
 
 logger = logging.getLogger(__name__)
 MARKET_CONTEXT_CACHE_TTL_SECONDS = 120
+MARKET_CONTEXT_STALE_FALLBACK_SECONDS = 21600
 _market_context_cache = {
     "data": None,
     "ts": 0.0,
@@ -51,6 +52,14 @@ def _get_cached_market_context():
     return copy.deepcopy(data), age_seconds
 
 
+def _peek_cached_market_context():
+    data = _market_context_cache.get("data")
+    if not data:
+        return None, None
+    age_seconds = time.time() - _market_context_cache["ts"]
+    return copy.deepcopy(data), age_seconds
+
+
 def _set_cached_market_context(context):
     _market_context_cache["data"] = copy.deepcopy(context)
     _market_context_cache["ts"] = time.time()
@@ -59,8 +68,15 @@ def _set_cached_market_context(context):
 async def get_market_context(*, prefer_cache=False):
     """Build a simple BTC-led market regime for alert gating."""
     cached_context, cached_age = _get_cached_market_context()
+    stale_context, stale_age = _peek_cached_market_context()
     if prefer_cache and cached_context:
         return cached_context
+    if prefer_cache and stale_context and stale_age is not None and stale_age <= MARKET_CONTEXT_STALE_FALLBACK_SECONDS:
+        logger.warning(
+            "Using stale BTC market context from %.0fs ago for command request.",
+            stale_age,
+        )
+        return stale_context
 
     screener_response = await screener_symbol("BTC", prefer_cache=prefer_cache, return_meta=True)
     screener = (screener_response or {}).get("data")
@@ -71,6 +87,12 @@ async def get_market_context(*, prefer_cache=False):
                 cached_age,
             )
             return cached_context
+        if stale_context and stale_age is not None and stale_age <= MARKET_CONTEXT_STALE_FALLBACK_SECONDS:
+            logger.warning(
+                "Using stale BTC market context from %.0fs ago after ALTfins degradation.",
+                stale_age,
+            )
+            return stale_context
         return _default_context()
 
     add = screener.get("additionalData", screener)

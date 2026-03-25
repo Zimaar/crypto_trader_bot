@@ -22,6 +22,8 @@ REQUEST_RETRY_BACKOFF_SECONDS = 0.8
 REQUEST_SEMAPHORE = asyncio.Semaphore(4)
 SCREENER_CACHE_TTL_SECONDS = 900
 SIGNAL_FEED_CACHE_TTL_SECONDS = 180
+SCREENER_STALE_FALLBACK_SECONDS = 86400
+SIGNAL_FEED_STALE_FALLBACK_SECONDS = 1800
 
 _screener_cache = {}
 _signal_feed_cache = {}
@@ -68,6 +70,14 @@ def _cache_set(cache, key, data):
         "data": data,
         "ts": time.time(),
     }
+
+
+def _cache_peek(cache, key):
+    entry = cache.get(key)
+    if not entry:
+        return None, None
+    age_seconds = time.time() - entry["ts"]
+    return entry["data"], age_seconds
 
 
 def _feed_cache_key(path, params, json_body):
@@ -154,12 +164,19 @@ async def get_signal_feed(
         {"size": size},
         body,
     )
+    stale_rows, stale_age = _cache_peek(_signal_feed_cache, cache_key)
 
     if prefer_cache:
-        cached_rows, _ = _cache_get(_signal_feed_cache, cache_key, cache_ttl_seconds)
+        cached_rows, cached_age = _cache_get(_signal_feed_cache, cache_key, cache_ttl_seconds)
         if cached_rows is not None:
             logger.info("Using cached ALTfins signal feed for command request.")
             return [_normalize_signal(dict(item)) for item in cached_rows]
+        if stale_rows is not None and stale_age is not None and stale_age <= SIGNAL_FEED_STALE_FALLBACK_SECONDS:
+            logger.warning(
+                "Using stale ALTfins signal feed cache from %.0fs ago for command request.",
+                stale_age,
+            )
+            return [_normalize_signal(dict(item)) for item in stale_rows]
 
     data = await _request(
         "POST",
@@ -179,6 +196,13 @@ async def get_signal_feed(
             age_seconds,
         )
         return [_normalize_signal(dict(item)) for item in cached_rows]
+
+    if stale_rows is not None and stale_age is not None and stale_age <= SIGNAL_FEED_STALE_FALLBACK_SECONDS:
+        logger.warning(
+            "ALTfins signal feed unavailable. Using stale cached feed from %.0fs ago.",
+            stale_age,
+        )
+        return [_normalize_signal(dict(item)) for item in stale_rows]
 
     return []
 
@@ -200,7 +224,7 @@ async def screener_oversold(min_mcap=100_000_000):
     return []
 
 
-async def screener_symbol(symbol, *, prefer_cache=False, return_meta=False):
+async def screener_symbol(symbol, *, prefer_cache=False, cache_only=False, return_meta=False):
     """Get screener data for a specific symbol."""
     normalized_symbol = str(symbol).upper()
     cached_snapshot, cached_age = _cache_get(
@@ -208,14 +232,35 @@ async def screener_symbol(symbol, *, prefer_cache=False, return_meta=False):
         normalized_symbol,
         SCREENER_CACHE_TTL_SECONDS,
     )
-    if prefer_cache and cached_snapshot is not None:
-        logger.info("Using cached screener snapshot for %s.", normalized_symbol)
-        result = {
-            "data": cached_snapshot,
-            "source": "cache",
-            "age_seconds": cached_age,
-        }
-        return result if return_meta else cached_snapshot
+    stale_snapshot, stale_age = _cache_peek(_screener_cache, normalized_symbol)
+    if prefer_cache or cache_only:
+        if cached_snapshot is not None:
+            logger.info("Using cached screener snapshot for %s.", normalized_symbol)
+            result = {
+                "data": cached_snapshot,
+                "source": "cache",
+                "age_seconds": cached_age,
+            }
+            return result if return_meta else cached_snapshot
+        if stale_snapshot is not None and stale_age is not None and stale_age <= SCREENER_STALE_FALLBACK_SECONDS:
+            logger.warning(
+                "Using stale screener snapshot for %s from %.0fs ago.",
+                normalized_symbol,
+                stale_age,
+            )
+            result = {
+                "data": stale_snapshot,
+                "source": "stale_cache",
+                "age_seconds": stale_age,
+            }
+            return result if return_meta else stale_snapshot
+        if cache_only:
+            result = {
+                "data": None,
+                "source": "unavailable",
+                "age_seconds": None,
+            }
+            return result if return_meta else None
 
     body = {
         "symbols": [normalized_symbol],
@@ -262,6 +307,19 @@ async def screener_symbol(symbol, *, prefer_cache=False, return_meta=False):
             "age_seconds": cached_age,
         }
         return result if return_meta else cached_snapshot
+
+    if stale_snapshot is not None and stale_age is not None and stale_age <= SCREENER_STALE_FALLBACK_SECONDS:
+        logger.warning(
+            "ALTfins screener unavailable for %s. Using stale snapshot from %.0fs ago.",
+            normalized_symbol,
+            stale_age,
+        )
+        result = {
+            "data": stale_snapshot,
+            "source": "stale_cache",
+            "age_seconds": stale_age,
+        }
+        return result if return_meta else stale_snapshot
 
     result = {
         "data": None,

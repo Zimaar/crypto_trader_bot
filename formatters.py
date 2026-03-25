@@ -353,6 +353,8 @@ def format_ta_report(
         ])
         if snapshot_status == "cache":
             lines.append("📦 Snapshot: Cached ALTfins data from the recent fallback window.")
+        elif snapshot_status == "stale_cache":
+            lines.append("📦 Snapshot: Using the last good ALTfins snapshot while the live endpoint is degraded.")
         elif snapshot_status == "unavailable":
             lines.append("⚠️ Live snapshot unavailable from ALTfins.")
         if latest_signal:
