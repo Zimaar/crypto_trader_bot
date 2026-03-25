@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from signal_scorer import parse_trend_score
+from signal_scorer import parse_mcap, parse_trend_score
 from trade_levels import build_trade_plan, format_percent, format_price
 
 
@@ -482,20 +482,100 @@ def format_daily_brief(signals_today, market_context, headlines=None, as_of=None
     return "\n".join(lines)
 
 
-def format_signal_feed(signals, symbol=None, limit=10):
-    """Format the latest bullish ALTfins signals feed rows."""
-    if not signals:
-        return f"🧭 SIGNALS FEED{' — ' + symbol if symbol else ''}\n\nNo recent bullish feed entries."
+def _signal_feed_bucket(signal):
+    raw = f"{signal.get('signalKey', '')} {signal.get('signalName', '')}".upper()
+    if any(token in raw for token in ["BREAKOUT", "PATTERN"]):
+        return "Breakouts"
+    if any(token in raw for token in ["MOMENTUM", "MACD", "EMA", "INFLECTION", "RSI"]):
+        return "Momentum"
+    return "Other"
 
-    lines = [f"🧭 SIGNALS FEED{' — ' + symbol if symbol else ''}"]
+
+def _format_market_cap_compact(value):
+    mcap = parse_mcap(value)
+    if not mcap:
+        return None
+    if mcap >= 1_000_000_000:
+        return f"${mcap / 1_000_000_000:.1f}B"
+    if mcap >= 1_000_000:
+        return f"${mcap / 1_000_000:.0f}M"
+    return f"${mcap:,.0f}"
+
+
+def _format_feed_metrics(signal, screener_data=None):
+    add = (screener_data or {}).get("additionalData", screener_data or {})
+
+    price = signal.get("lastPrice")
+    if price in (None, "") and screener_data:
+        price = screener_data.get("lastPrice")
+    metrics = [format_price(price) if price not in (None, "") else None]
+
+    rsi = add.get("RSI14")
+    if rsi not in (None, ""):
+        try:
+            metrics.append(f"RSI {float(rsi):.1f}")
+        except (TypeError, ValueError):
+            pass
+
+    volume = add.get("VOLUME_RELATIVE")
+    if volume not in (None, ""):
+        try:
+            metrics.append(f"Vol {float(volume):.2f}x")
+        except (TypeError, ValueError):
+            pass
+
+    medium_trend = add.get("MEDIUM_TERM_TREND", "")
+    if medium_trend:
+        metrics.append(f"Med {parse_trend_score(medium_trend)}/10")
+
+    change_1d = add.get("PRICE_CHANGE_1D")
+    if change_1d not in (None, ""):
+        try:
+            metrics.append(f"1D {float(change_1d):+.2f}%")
+        except (TypeError, ValueError):
+            pass
+
+    mcap_text = _format_market_cap_compact(signal.get("marketCap") or add.get("MARKET_CAP"))
+    if mcap_text:
+        metrics.append(f"MCap {mcap_text}")
+
+    return [entry for entry in metrics if entry]
+
+
+def format_signal_feed(signals, symbol=None, limit=12, screener_by_symbol=None):
+    """Format the latest bullish ALTfins breakout and momentum feed rows."""
+    if not signals:
+        return (
+            f"🧭 ALTFINS SIGNALS{' — ' + symbol if symbol else ''}\n\n"
+            "No recent bullish breakout or momentum signals."
+        )
+
+    lines = [
+        f"🧭 ALTFINS SIGNALS{' — ' + symbol if symbol else ''}",
+        "",
+        "Bullish breakout + momentum feed",
+    ]
+
+    groups = {"Breakouts": [], "Momentum": [], "Other": []}
     for signal in signals[:limit]:
-        timestamp = str(signal.get("timestamp", ""))[:16].replace("T", " ")
-        symbol_name = signal.get("symbol", "?")
-        signal_name = signal.get("signalName", signal.get("signalKey", "?"))
-        price = signal.get("lastPrice")
-        price_text = f"${price}" if price not in (None, "") else "N/A"
-        parts = [timestamp + " UTC" if timestamp else None, symbol_name, signal_name, price_text]
-        lines.append("• " + " | ".join(part for part in parts if part))
+        groups[_signal_feed_bucket(signal)].append(signal)
+
+    for title in ("Breakouts", "Momentum", "Other"):
+        entries = groups[title]
+        if not entries:
+            continue
+        lines.append("")
+        lines.append(f"📌 {title}")
+        for signal in entries:
+            timestamp = str(signal.get("timestamp", ""))[:16].replace("T", " ")
+            symbol_name = signal.get("symbol", "?")
+            signal_name = signal.get("signalName", signal.get("signalKey", "?"))
+            screener_data = (screener_by_symbol or {}).get(str(symbol_name).upper())
+            metrics = _format_feed_metrics(signal, screener_data=screener_data)
+
+            lines.append(f"• {symbol_name} — {signal_name}")
+            detail_parts = [timestamp + " UTC" if timestamp else None] + metrics
+            lines.append("  " + " | ".join(part for part in detail_parts if part))
     return "\n".join(lines)
 
 

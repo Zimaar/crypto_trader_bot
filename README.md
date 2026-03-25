@@ -11,7 +11,7 @@ The bot now does four things better:
 1. **Learns from outcomes**: signal-type and symbol-level hit rates now feed back into scoring.
 2. **Separates urgency from noise**: priority alerts are ranked and capped, while secondary setups go into a digest.
 3. **Filters randomness**: alerts are gated by BTC-led market context instead of a geopolitical score.
-4. **Uses stronger data fallbacks**: `/ta` uses screener snapshots and recent signals, `/feed` exposes the latest bullish Signals Feed rows, and `/news` now handles symbol-specific coverage more cleanly.
+4. **Uses stronger data fallbacks**: `/ta` uses screener snapshots and recent signals, `/signals` exposes the latest bullish Signals Feed rows with metrics, and `/news` now handles symbol-specific coverage more cleanly.
 
 ## Core Features
 
@@ -31,8 +31,9 @@ The bot now does four things better:
 |---------|-------------|
 | `/scan` | Force a full priority scan now |
 | `/digest` | Force the market digest now |
-| `/feed` | Latest bullish signals feed |
-| `/feed BTC` | Latest bullish signals feed filtered for one symbol |
+| `/signals` | Latest bullish breakout + momentum feed |
+| `/signals BTC` | Latest bullish breakout + momentum feed for one symbol |
+| `/feed` | Alias for `/signals` |
 | `/ta BTC` | Live market snapshot for a symbol |
 | `/focus` | Show the focus list |
 | `/focus add BTC ETH` | Add symbols to the focus list |
@@ -40,7 +41,6 @@ The bot now does four things better:
 | `/focus set BTC ETH` | Replace the focus list |
 | `/focus clear` | Clear the focus list and use market-wide mode |
 | `/accuracy` | Signal hit-rate report over the last 30 days |
-| `/signals` | Count of priority alerts sent today |
 | `/news` | Latest market headlines |
 | `/news BTC` | Headlines filtered for one symbol |
 | `/brief` | Force the daily brief now |

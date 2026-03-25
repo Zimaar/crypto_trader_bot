@@ -23,7 +23,6 @@ from database import (
     get_accuracy_stats,
     get_config,
     get_focus_symbols,
-    get_signal_count_today,
     remove_focus_symbols,
     set_config,
     set_focus_symbols,
@@ -146,10 +145,9 @@ async def init_telegram():
     commands = [
         ("scan", "Run a full priority scan now"),
         ("digest", "Send the digest now"),
-        ("feed", "Latest bullish signals feed"),
+        ("signals", "Latest ALTfins breakout + momentum feed"),
         ("ta", "Market snapshot for a coin: /ta BTC"),
         ("accuracy", "Priority alert accuracy stats (30d)"),
-        ("signals", "Priority alerts sent today"),
         ("news", "Latest crypto news: /news or /news BTC"),
         ("focus", "Manage focus list: /focus show"),
         ("brief", "Force daily brief now"),
@@ -220,7 +218,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "🤖 CryptoEdge Signal Bot — Active\n\n"
-        "Use /ta for the current market read, /feed for the latest bullish signals feed, and /focus "
+        "Use /ta for the current market read, /signals for the latest ALTfins signals feed, and /focus "
         "to manage your focus list. /help shows the full command set."
     )
 
@@ -232,7 +230,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 COMMANDS\n\n"
         "/scan — Force a full priority scan now\n"
         "/digest — Send the digest now\n"
-        "/feed — Latest bullish signals feed (or /feed BTC)\n"
+        "/signals — Latest ALTfins breakout + momentum feed (or /signals BTC)\n"
         "/ta BTC — Market snapshot with embedded AI when available\n"
         "/focus — Show focus list\n"
         "/focus add BTC ETH — Add symbols to focus list\n"
@@ -240,7 +238,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/focus set BTC ETH — Replace focus list\n"
         "/focus clear — Clear focus list and use market-wide mode\n"
         "/accuracy — Priority alert accuracy stats (30 days)\n"
-        "/signals — Priority alerts sent today\n"
         "/news — Latest crypto headlines (or /news BTC)\n"
         "/brief — Force daily brief now\n"
         "/pause — Pause all alerts\n"
@@ -270,22 +267,61 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
-async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _prepare_private_chat(update):
-        return
-    symbol = context.args[0].upper() if context.args else None
-    await update.message.reply_text("🧭 Fetching signals feed...")
-
+async def _load_feed_rows(symbol=None, *, hours_back=72, size=30):
     rows = await get_signal_feed(
         SIGNAL_TYPES_BREAKOUT + SIGNAL_TYPES_MOMENTUM,
         direction="BULLISH",
-        hours_back=24,
-        size=10,
+        hours_back=hours_back,
+        size=size,
         symbols=[symbol] if symbol else None,
         prefer_cache=True,
     )
-    rows = _sort_signals_by_timestamp(rows)
-    await update.message.reply_text(format_signal_feed(rows, symbol=symbol, limit=10))
+    return _sort_signals_by_timestamp(rows)
+
+
+async def _load_feed_screener_map(rows, limit=12):
+    symbols = []
+    seen = set()
+    for row in rows:
+        symbol = str(row.get("symbol", "")).upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+        if len(symbols) >= limit:
+            break
+
+    if not symbols:
+        return {}
+
+    screener_rows = await asyncio.gather(
+        *[
+            screener_symbol(symbol, return_meta=True, prefer_cache=True)
+            for symbol in symbols
+        ]
+    )
+    return {
+        symbol: (response or {}).get("data")
+        for symbol, response in zip(symbols, screener_rows)
+        if (response or {}).get("data")
+    }
+
+
+async def _send_signals_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    symbol = context.args[0].upper() if context.args else None
+    await update.message.reply_text("🧭 Fetching ALTfins signals...")
+
+    rows = await _load_feed_rows(symbol=symbol, hours_back=72, size=30)
+    screener_by_symbol = await _load_feed_screener_map(rows, limit=12)
+    await update.message.reply_text(
+        format_signal_feed(rows, symbol=symbol, limit=12, screener_by_symbol=screener_by_symbol)
+    )
+
+
+async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _prepare_private_chat(update):
+        return
+    await _send_signals_feed(update, context)
 
 
 async def _load_symbol_snapshot(symbol):
@@ -350,8 +386,7 @@ async def cmd_accuracy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _prepare_private_chat(update):
         return
-    count = await get_signal_count_today()
-    await update.message.reply_text(f"📊 Priority alerts sent today: {count}")
+    await _send_signals_feed(update, context)
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
